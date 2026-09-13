@@ -1,0 +1,19 @@
+#include <windows.h>
+#include "resource.h"
+
+/* CREATEPROCESS_MANIFEST_RESOURCE_ID, RT_MANIFEST */
+1 24 "app.manifest"
+
+IDD_MAIN DIALOGEX 0, 0, 330, 196
+STYLE DS_SETFONT | DS_CENTER | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "WiFi Control"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    AUTOCHECKBOX  "&Optimize the checked adapters", IDC_ENABLE, 7, 7, 200, 10
+    CONTROL       "", IDC_LIST, "SysListView32",
+                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
+                  7, 22, 316, 122
+    LTEXT         "", IDC_STATUS, 7, 150, 316, 20
+    PUSHBUTTON    "&Refresh", IDC_REFRESH, 219, 175, 50, 14
+    DEFPUSHBUTTON "&Hide", IDOK, 273, 175, 50, 14
+END

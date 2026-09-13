@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64-win32 binutils-mingw-w64-x86-64
+
+      - name: Unit-test the policy core
+        run: make test
+
+      - name: Cross-build the Windows binary
+        run: make
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wificontrol
+          path: build/wificontrol.exe
