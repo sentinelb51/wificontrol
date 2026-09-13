@@ -2,7 +2,7 @@
 #include "wlan.h"
 #include <string.h>
 
-static int guid_eq(const wc_guid *a, const wc_guid *b)
+static bool guid_eq(const wc_guid *a, const wc_guid *b)
 {
     return memcmp(a->b, b->b, sizeof a->b) == 0;
 }
@@ -18,10 +18,10 @@ void wc_init(wc_state *s, const wc_backend *be)
 {
     memset(s, 0, sizeof *s);
     s->be = *be;
-    s->enabled = 1;
+    s->enabled = true;
     /* Assume we may write until the probe says otherwise; a failed probe must
      * never stop us from trying, because the probe is only advisory. */
-    for (int o = 0; o < WC_OPT_COUNT; ++o) s->can_write[o] = 1;
+    for (int o = 0; o < WC_OPT_COUNT; ++o) s->can_write[o] = true;
 }
 
 void wc_probe_access(wc_state *s)
@@ -29,7 +29,7 @@ void wc_probe_access(wc_state *s)
     if (!s->be.granted_write) return;
     for (int o = 0; o < WC_OPT_COUNT; ++o) {
         int w = 1;
-        if (s->be.granted_write(s->be.ctx, (wc_opt)o, &w) == WC_OK) s->can_write[o] = w;
+        if (s->be.granted_write(s->be.ctx, (wc_opt)o, &w) == WC_OK) s->can_write[o] = (w != 0);
     }
 }
 
@@ -51,12 +51,12 @@ unsigned long wc_refresh(wc_state *s)
     unsigned long e = s->be.enum_ifaces(s->be.ctx, tmp, WC_MAX_ADAPTERS, &n);
     if (e != WC_OK) {
         s->enum_err = e;
-        for (int i = 0; i < s->n; ++i) s->ad[i].present = 0;
+        for (int i = 0; i < s->n; ++i) s->ad[i].present = false;
         return e;
     }
     s->enum_err = WC_OK;
 
-    for (int i = 0; i < s->n; ++i) s->ad[i].present = 0;
+    for (int i = 0; i < s->n; ++i) s->ad[i].present = false;
 
     for (int i = 0; i < n; ++i) {
         int j = wc_find(s, &tmp[i].guid);
@@ -65,14 +65,14 @@ unsigned long wc_refresh(wc_state *s)
             if (j < 0) continue;
             memset(&s->ad[j], 0, sizeof s->ad[j]);
             s->ad[j].guid      = tmp[i].guid;
-            s->ad[j].managed   = 1; /* new adapters are managed by default */
+            s->ad[j].managed   = true; /* new adapters are managed by default */
             s->ad[j].streaming = WC_VAL_UNKNOWN;
             s->ad[j].bgscan    = WC_VAL_UNKNOWN;
         }
         memcpy(s->ad[j].name, tmp[i].name, sizeof s->ad[j].name);
         s->ad[j].name[WC_NAME_MAX - 1] = '\0';
         s->ad[j].state   = tmp[i].state;
-        s->ad[j].present = 1;
+        s->ad[j].present = true;
     }
     return WC_OK;
 }
@@ -107,11 +107,11 @@ void wc_apply_one(wc_state *s, int i)
     wc_adapter *a = &s->ad[i];
     if (!a->present) return;
 
-    const int want = s->enabled && a->managed;
+    const bool want = s->enabled && a->managed;
 
     /* Nothing to do and nothing to undo. */
     if (!want && !a->touched) {
-        a->pending   = 0;
+        a->pending   = false;
         a->last_err  = WC_OK;
         a->streaming = a->bgscan = WC_VAL_UNKNOWN;
         return;
@@ -121,7 +121,7 @@ void wc_apply_one(wc_state *s, int i)
      * disconnect anyway.  This is the documented contract, not a failure. */
     if (a->state != WC_IF_CONNECTED) {
         a->pending   = want;
-        a->touched   = 0; /* the disconnect already dropped our request */
+        a->touched   = false; /* the disconnect already dropped our request */
         a->streaming = a->bgscan = WC_VAL_UNKNOWN;
         a->last_err  = WC_OK;
         return;
@@ -138,7 +138,7 @@ void wc_apply_one(wc_state *s, int i)
         return;
     }
 
-    a->pending = 0;
+    a->pending = false;
     a->touched = want;
     if (a->last_err) a->consec_fail++;
     else             a->consec_fail = 0;
@@ -157,26 +157,26 @@ unsigned long wc_poll(wc_state *s)
     return WC_OK;
 }
 
-void wc_set_enabled(wc_state *s, int on)
+void wc_set_enabled(wc_state *s, bool on)
 {
-    s->enabled = on ? 1 : 0;
+    s->enabled = on;
     wc_apply_all(s);
 }
 
-void wc_set_managed(wc_state *s, int i, int on)
+void wc_set_managed(wc_state *s, int i, bool on)
 {
     if (i < 0 || i >= s->n) return;
-    s->ad[i].managed = on ? 1 : 0;
+    s->ad[i].managed = on;
     wc_apply_one(s, i);
 }
 
-int wc_needs_elevation(const wc_state *s)
+bool wc_write_denied(const wc_state *s)
 {
     for (int o = 0; o < WC_OPT_COUNT; ++o)
-        if (!s->can_write[o]) return 1;
+        if (!s->can_write[o]) return true;
     for (int i = 0; i < s->n; ++i)
-        if (s->ad[i].present && s->ad[i].last_err == WC_E_ACCESS_DENIED) return 1;
-    return 0;
+        if (s->ad[i].present && s->ad[i].last_err == WC_E_ACCESS_DENIED) return true;
+    return false;
 }
 
 const char *wc_state_name(wc_ifstate st)
@@ -199,6 +199,6 @@ const char *wc_strerror(unsigned long code)
     switch (code) {
     case WC_E_VERIFY:  return "setting did not stick (driver rejected it)";
     case WC_E_BADDATA: return "driver returned an unexpected value";
-    default:           return (code >= WC_E_APP) ? "unknown internal error" : (const char *)0;
+    default:           return (code >= WC_E_APP) ? "unknown internal error" : nullptr;
     }
 }

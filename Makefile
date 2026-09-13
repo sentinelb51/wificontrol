@@ -11,17 +11,27 @@ WINDRES  = $(CROSS)windres
 CC      ?= cc
 BUILD   ?= build
 
+# Newest C standard each compiler accepts.  GCC only learned the -std=c23
+# spelling in 14; 13 and earlier want -std=c2x for the same language.
+newest_std = $(shell for s in c23 c2x c17 c11; do \
+               $(1) -std=$$s -fsyntax-only -x c /dev/null >/dev/null 2>&1 && { echo $$s; break; }; done)
+STD      ?= $(call newest_std,$(WINCC))
+HOSTSTD  ?= $(call newest_std,$(CC))
+
 WARN     = -Wall -Wextra -Werror
-WCFLAGS  = -std=c11 $(WARN) -Os -municode -D_WIN32_WINNT=0x0601 \
+OPT     ?= -O3 -flto=auto -fuse-linker-plugin -fno-ident
+HARDEN  ?= -fstack-protector-strong -fcf-protection=full
+WCFLAGS  = -std=$(STD) $(WARN) $(OPT) $(HARDEN) -municode -D_WIN32_WINNT=0x0601 \
            -ffunction-sections -fdata-sections
-WLDFLAGS = -municode -mwindows -Wl,--gc-sections -s
+WLDFLAGS = -municode -mwindows $(OPT) -Wl,--gc-sections -s \
+           -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
 WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32
 
 WSRC     = src/app.c src/wlan_core.c src/wlan_win32.c
 WOBJ     = $(patsubst src/%.c,$(BUILD)/%.o,$(WSRC)) $(BUILD)/app.res.o
 
 TESTBIN  = $(BUILD)/test_core
-TESTFLAGS= -std=c11 $(WARN) -g -fsanitize=address,undefined
+TESTFLAGS= -std=$(HOSTSTD) $(WARN) -g -fsanitize=address,undefined
 
 .PHONY: all test clean
 all: $(BUILD)/wificontrol.exe
@@ -37,7 +47,7 @@ $(BUILD)/app.res.o: src/app.rc src/resource.h src/app.manifest | $(BUILD)
 
 $(BUILD)/wificontrol.exe: $(WOBJ)
 	$(WINCC) $(WOBJ) -o $@ $(WLDFLAGS) $(WLIBS)
-	@echo "built $@ ($$(stat -c %s $@ 2>/dev/null || stat -f %z $@) bytes)"
+	@echo "built $@ with -std=$(STD) ($$(stat -c %s $@ 2>/dev/null || stat -f %z $@) bytes)"
 
 test: $(TESTBIN)
 	./$(TESTBIN)

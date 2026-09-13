@@ -62,10 +62,10 @@ typedef struct {
     wc_guid       guid;
     char          name[WC_NAME_MAX];
     wc_ifstate    state;
-    int           present;      /* seen in the most recent enumeration */
-    int           managed;      /* user wants this adapter optimized */
-    int           touched;      /* we have an outstanding request on it */
-    int           pending;      /* wants optimizing but is not connected yet */
+    bool          present;      /* seen in the most recent enumeration */
+    bool          managed;      /* user wants this adapter optimized */
+    bool          touched;      /* we have an outstanding request on it */
+    bool          pending;      /* wants optimizing but is not connected yet */
     wc_val        streaming;    /* last value read back */
     wc_val        bgscan;
     unsigned long last_err;     /* WC_OK when the last pass succeeded */
@@ -74,10 +74,10 @@ typedef struct {
 
 typedef struct {
     wc_backend    be;
-    int           enabled;                 /* master switch */
+    bool          enabled;                 /* master switch */
     wc_adapter    ad[WC_MAX_ADAPTERS];
     int           n;
-    int           can_write[WC_OPT_COUNT]; /* advisory: from WlanGetSecuritySettings */
+    bool          can_write[WC_OPT_COUNT]; /* advisory: from WlanGetSecuritySettings */
     unsigned long enum_err;
 } wc_state;
 
@@ -87,13 +87,15 @@ unsigned long wc_refresh     (wc_state *s);          /* enumerate, merge, keep u
 void          wc_apply_all   (wc_state *s);
 void          wc_apply_one   (wc_state *s, int i);
 unsigned long wc_poll        (wc_state *s);          /* refresh + apply_all */
-void          wc_set_enabled (wc_state *s, int on);
-void          wc_set_managed (wc_state *s, int i, int on);
+void          wc_set_enabled (wc_state *s, bool on);
+void          wc_set_managed (wc_state *s, int i, bool on);
 int           wc_find        (const wc_state *s, const wc_guid *g); /* -1 if absent */
 
 /* True once any adapter has reported ERROR_ACCESS_DENIED, or the advisory
- * probe says we lack write access.  Drives the "needs elevation" hint. */
-int           wc_needs_elevation(const wc_state *s);
+ * probe says we lack write access.  The app manifest already demands
+ * administrator, so this means the Native Wifi securable object's DACL or a
+ * group policy is refusing the write -- not that we need to elevate. */
+bool          wc_write_denied(const wc_state *s);
 
 const char   *wc_state_name(wc_ifstate st);
 const char   *wc_strerror   (unsigned long code); /* only for WC_E_APP codes; else NULL */

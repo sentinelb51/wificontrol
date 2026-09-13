@@ -16,13 +16,13 @@ typedef struct {
     long          val[4][WC_OPT_COUNT]; /* raw driver values */
     long          raw_true;             /* what this "driver" calls TRUE */
     unsigned long q_err, s_err;
-    int           stick;                /* 0: set succeeds but nothing changes */
+    bool          stick;                /* false: set succeeds but nothing changes */
     int           nq, ns;               /* call counts */
     int           nset[4];              /* writes per adapter */
-    int           can_write[WC_OPT_COUNT];
+    bool          can_write[WC_OPT_COUNT];
 } fake;
 
-static int fake_index(fake *f, const wc_guid *g)
+static int fake_index(const fake *f, const wc_guid *g)
 {
     for (int i = 0; i < f->n; ++i)
         if (memcmp(f->ifs[i].guid.b, g->b, 16) == 0) return i;
@@ -61,7 +61,7 @@ static unsigned long f_set(void *ctx, const wc_guid *g, wc_opt o, int v)
 static unsigned long f_granted(void *ctx, wc_opt o, int *w)
 {
     fake *f = ctx;
-    *w = f->can_write[o];
+    *w = f->can_write[o] ? 1 : 0;
     return WC_OK;
 }
 
@@ -70,8 +70,8 @@ static void fake_init(fake *f, int nifs)
     memset(f, 0, sizeof *f);
     f->n = nifs;
     f->raw_true = 1;
-    f->stick = 1;
-    for (int i = 0; i < WC_OPT_COUNT; ++i) f->can_write[i] = 1;
+    f->stick = true;
+    for (int i = 0; i < WC_OPT_COUNT; ++i) f->can_write[i] = true;
     for (int i = 0; i < nifs; ++i) {
         f->ifs[i].guid.b[0] = (unsigned char)(i + 1);
         f->ifs[i].state = WC_IF_CONNECTED;
@@ -133,14 +133,14 @@ static void t_disconnected_is_pending_not_error(void)
     f.ifs[0].state = WC_IF_DISCONNECTED;
 
     wc_poll(&s);
-    CHECK(s.ad[0].pending == 1);
+    CHECK(s.ad[0].pending);
     CHECK(s.ad[0].last_err == WC_OK);
     CHECK(f.ns == 0);
 
     /* Reconnect: the very next poll applies, which is what an ACM event triggers. */
     f.ifs[0].state = WC_IF_CONNECTED;
     wc_poll(&s);
-    CHECK(s.ad[0].pending == 0);
+    CHECK(!s.ad[0].pending);
     CHECK(f.val[0][WC_OPT_STREAMING] == 1);
 }
 
@@ -152,7 +152,7 @@ static void t_invalid_state_race(void)
 
     wc_poll(&s);
     CHECK(s.ad[0].last_err == WC_OK);
-    CHECK(s.ad[0].pending == 1);
+    CHECK(s.ad[0].pending);
 }
 
 static void t_transient_error_does_not_stop_us(void)
@@ -178,7 +178,7 @@ static void t_verify_mismatch(void)
 {
     printf("reports a setting the driver silently drops\n");
     fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
-    f.stick = 0;
+    f.stick = false;
 
     wc_poll(&s);
     CHECK(s.ad[0].last_err == WC_E_VERIFY);
@@ -191,12 +191,12 @@ static void t_disable_withdraws_request(void)
     fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
 
     wc_poll(&s);
-    CHECK(s.ad[0].touched == 1);
+    CHECK(s.ad[0].touched);
 
-    wc_set_enabled(&s, 0);
+    wc_set_enabled(&s, false);
     CHECK(f.val[0][WC_OPT_STREAMING] == 0);
     CHECK(f.val[0][WC_OPT_BGSCAN]    == 1);
-    CHECK(s.ad[0].touched == 0);
+    CHECK(!s.ad[0].touched);
 
     int writes = f.ns;
     wc_poll(&s);
@@ -210,7 +210,7 @@ static void t_unmanaged_is_never_written(void)
     fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
 
     wc_refresh(&s);
-    wc_set_managed(&s, 1, 0);
+    wc_set_managed(&s, 1, false);
     wc_poll(&s);
     wc_poll(&s);
     CHECK(f.nset[1] == 0);                  /* never written to at all */
@@ -226,16 +226,16 @@ static void t_managed_flag_survives_unplug(void)
     fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
 
     wc_refresh(&s);
-    wc_set_managed(&s, 1, 0);
+    wc_set_managed(&s, 1, false);
 
     f.n = 1;                       /* dongle unplugged */
     wc_poll(&s);
-    CHECK(s.ad[1].present == 0);
+    CHECK(!s.ad[1].present);
 
     f.n = 2;                       /* back again */
     wc_poll(&s);
-    CHECK(s.ad[1].present == 1);
-    CHECK(s.ad[1].managed == 0);
+    CHECK(s.ad[1].present);
+    CHECK(!s.ad[1].managed);
     CHECK(f.val[1][WC_OPT_STREAMING] == 0);
 }
 
@@ -247,17 +247,17 @@ static void t_access_denied_flags_elevation(void)
 
     wc_poll(&s);
     CHECK(s.ad[0].last_err == WC_E_ACCESS_DENIED);
-    CHECK(wc_needs_elevation(&s) == 1);
+    CHECK(wc_write_denied(&s));
 }
 
 static void t_probe_is_advisory(void)
 {
     printf("a denied probe still lets us try\n");
     fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
-    f.can_write[WC_OPT_BGSCAN] = 0;
+    f.can_write[WC_OPT_BGSCAN] = false;
 
     wc_probe_access(&s);
-    CHECK(wc_needs_elevation(&s) == 1);
+    CHECK(wc_write_denied(&s));
     wc_poll(&s);
     CHECK(f.val[0][WC_OPT_BGSCAN] == 0); /* attempted anyway, and it worked */
 }

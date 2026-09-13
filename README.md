@@ -57,9 +57,11 @@ Line references are to `WLANOptimizer.cpp` in the upstream project.
 - **A one-second blocking call with no thread to run on.** `WlanSetInterface`
   takes about a second and the original holds a global mutex across it. Here it
   runs on a worker thread that owns the WLAN handle; the UI thread never blocks.
-- **`ERROR_ACCESS_DENIED` is invisible.** We probe `WlanGetSecuritySettings`
-  for write access at startup and say plainly that the app needs to run
-  elevated, instead of failing silently at apply time.
+- **`ERROR_ACCESS_DENIED` is invisible.** The original returns a code nobody
+  sees. This app requests administrator up front so the common case never
+  arises, and still probes `WlanGetSecuritySettings` at startup — so if a write
+  is refused *even elevated*, it says so and names the likely cause (a group
+  policy or a changed Native Wifi DACL) instead of failing silently.
 
 ## Design notes
 
@@ -89,16 +91,37 @@ Line references are to `WLANOptimizer.cpp` in the upstream project.
 
 ## Using it
 
+The app manifest requests administrator, because `WlanSetInterface` on these
+two opcodes is gated by the Native Wifi securable objects and a standard user
+is normally refused. So there is **one UAC prompt each time it starts**, and no
+permission problems after that.
+
 Run it. Adapters are listed with a checkbox each; uncheck one to leave it
 alone. The master checkbox turns everything off and hands the settings back
 without quitting. Closing the window hides it to the tray — the settings only
 last while the process is alive — and Exit in the tray menu really quits.
 
-`wificontrol.exe /tray` starts hidden, for a shortcut in `shell:startup`.
+### Starting it automatically
 
-Settings live in `%LOCALAPPDATA%\WifiControl\wificontrol.ini`, or in a
-`wificontrol.ini` next to the executable if you create one there first
-(portable mode). Nothing else is written.
+An app that requires administrator **cannot** be launched from the Startup
+folder or a `Run` key: Windows will not raise a UAC prompt at logon, so the
+entry is silently skipped. Use a scheduled task with highest privileges
+instead, which starts it elevated with no prompt at all:
+
+```
+schtasks /create /tn WifiControl /sc onlogon /rl highest /f ^
+         /tr "\"C:\path\to\wificontrol.exe\" /tray"
+```
+
+`/tray` starts it hidden in the notification area. Remove it again with
+`schtasks /delete /tn WifiControl /f`.
+
+### Where settings live
+
+`%LOCALAPPDATA%\WifiControl\wificontrol.ini`, or a `wificontrol.ini` next to
+the executable if you create one there first (portable mode). Nothing else is
+written. Note that if you elevate using a *different* administrator account,
+`%LOCALAPPDATA%` resolves to that account's profile.
 
 ## Building
 
@@ -106,8 +129,20 @@ Needs mingw-w64; nothing else. Builds from Linux, macOS or MSYS2.
 
 ```
 make          # build/wificontrol.exe
-make test     # run the core tests natively
+make test     # run the core tests natively under ASan/UBSan
 ```
+
+The Makefile probes for the newest C standard each compiler accepts —
+`-std=c23` on GCC 14+, `-std=c2x` on GCC 13 and earlier, which is the same
+language under the older spelling. Override with `make STD=c17` if you need to.
+
+Built `-O3 -flto` with `-ffunction-sections`/`--gc-sections`, plus
+`-fstack-protector-strong`, `-fcf-protection=full` (Intel CET) and
+`--dynamicbase --nxcompat --high-entropy-va`, so the binary ships with ASLR,
+DEP and high-entropy 64-bit relocation. Override the two flag groups with
+`make OPT=-Os HARDEN=` if you want the smallest possible build instead — it
+saves about 2 KB, and nothing in this program is hot enough for `-O3` to
+matter otherwise.
 
 ## Layout
 

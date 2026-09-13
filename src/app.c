@@ -48,21 +48,22 @@ typedef struct {
     wc_guid       guid;
     wchar_t       name[WC_NAME_MAX];
     wc_ifstate    state;
-    int           present, managed, pending;
+    bool          present, managed, pending;
     wc_val        streaming, bgscan;
     unsigned long last_err;
 } snap_row;
 
 typedef struct {
-    int           n, enabled, needs_elev;
+    int           n;
+    bool          enabled, write_denied;
     unsigned long enum_err, open_err;
     snap_row      row[WC_MAX_ADAPTERS];
 } snapshot;
 
-typedef struct { wc_guid g; int managed; } cfg_entry;
-typedef struct { int enabled, n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
+typedef struct { wc_guid g; bool managed; } cfg_entry;
+typedef struct { bool enabled; int n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
 
-typedef struct { wc_guid g; int on; } manage_cmd;
+typedef struct { wc_guid g; bool on; } manage_cmd;
 
 /* ----------------------------------------------------------------- config */
 
@@ -73,19 +74,19 @@ static void guid_to_str(const wc_guid *g, wchar_t *buf, int cap)
     wcw_guid_to_string(g, buf, cap);
 }
 
-static int str_to_guid(const wchar_t *s, wc_guid *g)
+static bool str_to_guid(const wchar_t *s, wc_guid *g)
 {
     unsigned int d1, d2, d3, b[8];
     if (swscanf(s, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
                 &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
-        return 0;
+        return false;
     GUID out;
     out.Data1 = (unsigned long)d1;
     out.Data2 = (unsigned short)d2;
     out.Data3 = (unsigned short)d3;
     for (int i = 0; i < 8; ++i) out.Data4[i] = (unsigned char)b[i];
     memcpy(g->b, &out, sizeof g->b);
-    return 1;
+    return true;
 }
 
 /* Portable when an ini already sits next to the exe, per-user otherwise. */
@@ -114,7 +115,7 @@ static void cfg_resolve_path(void)
 static void cfg_load(cfg *c)
 {
     memset(c, 0, sizeof *c);
-    c->enabled = GetPrivateProfileIntW(L"general", L"enabled", 1, g_cfg_path) ? 1 : 0;
+    c->enabled = GetPrivateProfileIntW(L"general", L"enabled", 1, g_cfg_path) != 0;
 
     /* Adapters absent from the file default to managed. */
     wchar_t buf[4096];
@@ -135,12 +136,12 @@ static void cfg_load(cfg *c)
     }
 }
 
-static void cfg_save_enabled(int on)
+static void cfg_save_enabled(bool on)
 {
     WritePrivateProfileStringW(L"general", L"enabled", on ? L"1" : L"0", g_cfg_path);
 }
 
-static void cfg_save_managed(const wc_guid *g, int on)
+static void cfg_save_managed(const wc_guid *g, bool on)
 {
     wchar_t key[64];
     guid_to_str(g, key, 64);
@@ -158,7 +159,7 @@ static void raster(unsigned char *px, int size, COLORREF c)
     const double ox = cx, oy = cy + size * 0.26;
     const double dotr = size * 0.085, halfw = size * 0.055;
     const double rad[3] = { size * 0.20, size * 0.33, size * 0.46 };
-    const int S = 4;
+    constexpr int S = 4;  /* supersampling factor */
     const double cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
 
     for (int y = 0; y < size; ++y) {
@@ -260,7 +261,7 @@ static void worker_send_snapshot(void)
 
     s->n          = g_core.n;
     s->enabled    = g_core.enabled;
-    s->needs_elev = wc_needs_elevation(&g_core);
+    s->write_denied = wc_write_denied(&g_core);
     s->enum_err   = g_core.enum_err;
     s->open_err   = g_open_err;
 
@@ -299,9 +300,9 @@ static void worker_schedule(HWND hwnd)
     SetTimer(hwnd, T_DEBOUNCE, delay, NULL);
 }
 
-static void CALLBACK acm_callback(PWLAN_NOTIFICATION_DATA data, PVOID ctx)
+static void CALLBACK acm_callback([[maybe_unused]] PWLAN_NOTIFICATION_DATA data,
+                                  [[maybe_unused]] PVOID ctx)
 {
-    (void)data; (void)ctx;
     /* Runs on a wlanapi thread: post and return, never call back into the API
      * and never block. */
     if (g_worker) PostMessageW(g_worker, WM_W_POLL, 0, 0);
@@ -347,9 +348,8 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static unsigned __stdcall worker_main(void *param)
+static unsigned __stdcall worker_main([[maybe_unused]] void *param)
 {
-    (void)param;
 
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof wc);
@@ -418,7 +418,7 @@ static int       g_base_n;
 static COLORREF state_color(const snapshot *s)
 {
     if (!s || s->open_err || s->enum_err) return RGB(200, 60, 60);
-    if (s->needs_elev)                    return RGB(214, 152, 32);
+    if (s->write_denied)                  return RGB(214, 152, 32);
     if (!s->enabled)                      return RGB(128, 132, 138);
     for (int i = 0; i < s->n; ++i)
         if (s->row[i].present && s->row[i].last_err) return RGB(214, 152, 32);
@@ -487,7 +487,7 @@ static const wchar_t *val_text(wc_val v)
     return v == WC_VAL_ON ? L"on" : v == WC_VAL_OFF ? L"off" : L"–";
 }
 
-static void row_status(const snap_row *r, int enabled, wchar_t *out, int cap)
+static void row_status(const snap_row *r, bool enabled, wchar_t *out, int cap)
 {
     if (!r->present)          { wcsncpy(out, L"not present", (size_t)cap - 1); out[cap-1]=0; return; }
     if (r->last_err)          { wcw_format_error(r->last_err, out, cap); return; }
@@ -545,9 +545,9 @@ static void update_status(HWND hwnd)
     } else if (g_snap->enum_err) {
         wcw_format_error(g_snap->enum_err, err, 256);
         _snwprintf(text, 512, L"Cannot list adapters: %s", err);
-    } else if (g_snap->needs_elev) {
-        _snwprintf(text, 512, L"Windows is refusing these settings for a standard user. "
-                              L"Restart this app as administrator to apply them.");
+    } else if (g_snap->write_denied) {
+        wcscpy(text, L"Windows is refusing these settings even with administrator rights.\r\n"
+                     L"A group policy or a Native Wifi permission change is blocking them.");
     } else {
         int active = 0, waiting = 0;
         for (int i = 0; i < g_snap->n; ++i) {
@@ -571,7 +571,7 @@ static void update_status(HWND hwnd)
     tray_update(hwnd, text);
 }
 
-static void send_manage(const wc_guid *g, int on)
+static void send_manage(const wc_guid *g, bool on)
 {
     manage_cmd *c = malloc(sizeof *c);
     if (!c) return;
@@ -602,9 +602,8 @@ static int dpi_of(HWND hwnd)
     return d ? d : 96;
 }
 
-static BOOL CALLBACK cache_child(HWND child, LPARAM lp)
+static BOOL CALLBACK cache_child(HWND child, [[maybe_unused]] LPARAM lp)
 {
-    (void)lp;
     if (g_base_n >= 16) return FALSE;
     RECT r;
     GetWindowRect(child, &r);
@@ -633,7 +632,7 @@ static void apply_font(HWND hwnd, int dpi)
 static void layout_columns(HWND hwnd, int dpi)
 {
     HWND lv = GetDlgItem(hwnd, IDC_LIST);
-    static const int w[5] = { 150, 74, 52, 52, 150 };
+    static constexpr int w[5] = { 150, 74, 52, 52, 150 };
     for (int i = 0; i < 5; ++i) ListView_SetColumnWidth(lv, i, MulDiv(w[i], dpi, 96));
 }
 
@@ -739,7 +738,7 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 int now = (int)((nv->uNewState & LVIS_STATEIMAGEMASK) >> 12);
                 if (was && now && was != now && g_snap &&
                     nv->lParam >= 0 && nv->lParam < g_snap->n) {
-                    int on = (now == 2);
+                    bool on = (now == 2);
                     const wc_guid *g = &g_snap->row[nv->lParam].guid;
                     g_snap->row[nv->lParam].managed = on;
                     cfg_save_managed(g, on);
@@ -758,13 +757,13 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_ENABLE: {
-            int on = IsDlgButtonChecked(hwnd, IDC_ENABLE) == BST_CHECKED;
+            bool on = IsDlgButtonChecked(hwnd, IDC_ENABLE) == BST_CHECKED;
             cfg_save_enabled(on);
             PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
             return TRUE;
         }
         case IDM_TOGGLE: {
-            int on = !(g_snap && g_snap->enabled);
+            bool on = !(g_snap && g_snap->enabled);
             CheckDlgButton(hwnd, IDC_ENABLE, on ? BST_CHECKED : BST_UNCHECKED);
             cfg_save_enabled(on);
             PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
@@ -815,9 +814,9 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 /* ------------------------------------------------------------------- main */
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
+int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
+                    LPWSTR cmdline, [[maybe_unused]] int show)
 {
-    (void)prev; (void)show;
 
     g_msg_show    = RegisterWindowMessageW(L"WifiControl.Show");
     g_msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
