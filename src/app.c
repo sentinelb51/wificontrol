@@ -7,6 +7,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include "wlan_win32.h"
+#include "tune.h"
 #include "resource.h"
 
 #include <commctrl.h>
@@ -785,6 +786,26 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_REFRESH:
             PostMessageW(g_worker, WM_W_POLL, 0, 0);
             return TRUE;
+        case IDC_TUNE: {
+            if (!g_snap || g_snap->n == 0) {
+                MessageBoxW(hwnd, L"No Wi-Fi adapter to tune.", L"Tuning", MB_ICONINFORMATION);
+                return TRUE;
+            }
+            HWND lv = GetDlgItem(hwnd, IDC_LIST);
+            int row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+            int i = -1;
+            if (row >= 0) {
+                LVITEMW it = { .mask = LVIF_PARAM, .iItem = row };
+                if (ListView_GetItem(lv, &it) && it.lParam >= 0 && it.lParam < g_snap->n)
+                    i = (int)it.lParam;
+            }
+            if (i < 0)
+                for (int k = 0; k < g_snap->n; ++k)
+                    if (g_snap->row[k].present) { i = k; break; }
+            if (i < 0) i = 0;
+            tune_dialog(hwnd, &g_snap->row[i].guid, g_snap->row[i].name);
+            return TRUE;
+        }
         case IDM_SHOW:
             show_main(hwnd);
             return TRUE;

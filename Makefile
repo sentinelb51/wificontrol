@@ -37,9 +37,11 @@ WCFLAGS  = -std=$(STD) $(WARN) $(OPT) $(if $(ARCH),-march=$(ARCH)) \
 WLDFLAGS = -municode -mwindows $(OPT) $(if $(ARCH),-march=$(ARCH)) \
            -Wl,--gc-sections -s \
            -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
-WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32
+WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32 \
+           -lsetupapi -lpowrprof -ladvapi32 -luuid
 
-WSRC     = src/app.c src/wlan_core.c src/wlan_win32.c
+WSRC     = src/app.c src/wlan_core.c src/wlan_win32.c \
+           src/tune.c src/tune_driver.c src/tune_power.c src/tune_ui.c
 WOBJ     = $(patsubst src/%.c,$(BUILD)/%.o,$(WSRC)) $(BUILD)/app.res.o
 
 TESTBIN  = $(BUILD)/test_core
@@ -73,3 +75,7 @@ clean:
 $(BUILD)/app.o:        src/wlan.h src/wlan_win32.h src/resource.h
 $(BUILD)/wlan_core.o:  src/wlan.h
 $(BUILD)/wlan_win32.o: src/wlan.h src/wlan_win32.h
+$(BUILD)/tune.o:        src/tune.h src/wlan.h
+$(BUILD)/tune_driver.o: src/tune.h src/wlan.h src/wlan_win32.h
+$(BUILD)/tune_power.o:  src/tune.h src/wlan.h
+$(BUILD)/tune_ui.o:     src/tune.h src/wlan.h src/wlan_win32.h src/resource.h

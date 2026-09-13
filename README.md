@@ -63,6 +63,39 @@ Line references are to `WLANOptimizer.cpp` in the upstream project.
   is refused *even elevated*, it says so and names the likely cause (a group
   policy or a changed Native Wifi DACL) instead of failing silently.
 
+## Tuning
+
+The **Tuning...** button opens the settings that actually move Wi-Fi latency,
+which the two wlanapi opcodes do not touch: the adapter's own advanced
+properties and the active power scheme.
+
+Every one of them is a dropdown containing exactly the choices the system
+declares, and the rules are the same throughout:
+
+- **Nothing is automatic.** The app never picks a value, never recommends one,
+  and never applies anything on its own. You choose, you press Apply.
+- **Nothing is hardcoded.** Adapter properties come from the driver's own
+  `Ndi\Params` metadata, so whatever your card exposes -- roaming
+  aggressiveness, power save mode, scan-when-associated, throughput booster --
+  appears under the name the driver gives it. Power settings are enumerated
+  from the active scheme, subgroup by subgroup, so no setting GUID is baked in
+  and nothing is missed. Settings that are a numeric range rather than a list
+  of choices are left out; they are not dropdowns.
+- **No before/after tracking, no undo journal.** The registry and the power
+  scheme are the state. Nothing is recorded anywhere about what a value used to
+  be. To undo a change, pick the other entry in the same dropdown.
+- **Only what you changed is written.** Untouched dropdowns are not rewritten.
+
+Power settings are listed twice, once for **plugged in** and once for **on
+battery**, because Windows stores them separately and writing one would say
+nothing about the other. They take effect immediately.
+
+Adapter properties do not: the miniport reads them when it starts, so a change
+sits in the registry until the device restarts. **Restart adapter** does that
+explicitly -- it disables and re-enables the device the way Device Manager does
+when you press OK on the Advanced tab, and it drops the link for a few seconds.
+It asks first, and it never happens on its own.
+
 ## Design notes
 
 - **ACM notifications only.** `WLAN_NOTIFICATION_SOURCE_MSM` additionally
@@ -157,4 +190,8 @@ instruction it does not have.
 | `src/wlan.h`, `src/wlan_core.c` | policy: what to apply, when to retry, how to read an error |
 | `src/wlan_win32.c` | the only file that touches wlanapi |
 | `src/app.c` | window, list, tray, DPI, config, worker thread |
+| `src/tune.h`, `src/tune.c` | the settings model, and writing only what changed |
+| `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params` |
+| `src/tune_power.c` | the active power scheme, enumerated rather than hardcoded |
+| `src/tune_ui.c` | the tuning dialog |
 | `tests/test_core.c` | regression test per fixed defect |
