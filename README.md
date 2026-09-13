@@ -136,13 +136,19 @@ The Makefile probes for the newest C standard each compiler accepts —
 `-std=c23` on GCC 14+, `-std=c2x` on GCC 13 and earlier, which is the same
 language under the older spelling. Override with `make STD=c17` if you need to.
 
-Built `-O3 -flto` with `-ffunction-sections`/`--gc-sections`, plus
-`-fstack-protector-strong`, `-fcf-protection=full` (Intel CET) and
-`--dynamicbase --nxcompat --high-entropy-va`, so the binary ships with ASLR,
-DEP and high-entropy 64-bit relocation. Override the two flag groups with
-`make OPT=-Os HARDEN=` if you want the smallest possible build instead — it
-saves about 2 KB, and nothing in this program is hot enough for `-O3` to
-matter otherwise.
+Built `-O3 -flto` with `-ffunction-sections`/`--gc-sections`. Nothing is
+allowed to add instructions to the hot path: `-fno-stack-protector` (no canary
+load and compare per frame) and `-fcf-protection=none` (no `endbr64` at every
+indirect branch target). The resulting binary contains zero of either.
+
+`--dynamicbase --nxcompat --high-entropy-va` stay on. Those are PE header bits
+and load-time relocations — they execute nothing and cost no CPU, and without
+them the binary is the kind of thing SmartScreen and AV heuristics flag.
+
+`make OPT=-Os` for the smallest build. `make ARCH=x86-64-v2` (SSE4.2, ~2009+)
+or `ARCH=x86-64-v3` (AVX2, ~2013+) if you only ever run it on your own
+machines; the default baseline runs anywhere, and an older CPU will fault on an
+instruction it does not have.
 
 ## Layout
 

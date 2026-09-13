@@ -19,11 +19,23 @@ STD      ?= $(call newest_std,$(WINCC))
 HOSTSTD  ?= $(call newest_std,$(CC))
 
 WARN     = -Wall -Wextra -Werror
-OPT     ?= -O3 -flto=auto -fuse-linker-plugin -fno-ident
-HARDEN  ?= -fstack-protector-strong -fcf-protection=full
-WCFLAGS  = -std=$(STD) $(WARN) $(OPT) $(HARDEN) -municode -D_WIN32_WINNT=0x0601 \
-           -ffunction-sections -fdata-sections
-WLDFLAGS = -municode -mwindows $(OPT) -Wl,--gc-sections -s \
+
+# Nothing that puts instructions on the hot path: no stack canary load and
+# compare per frame, no endbr64 at every indirect branch target.
+OPT     ?= -O3 -flto=auto -fuse-linker-plugin -fno-ident \
+           -fno-stack-protector -fcf-protection=none
+
+# Baseline is plain x86-64 so the binary runs anywhere.  ARCH=x86-64-v2
+# (SSE4.2, ~2009+) or x86-64-v3 (AVX2, ~2013+) if you only target your own
+# machines -- an older CPU faults on an unsupported instruction.
+ARCH    ?=
+
+WCFLAGS  = -std=$(STD) $(WARN) $(OPT) $(if $(ARCH),-march=$(ARCH)) \
+           -municode -D_WIN32_WINNT=0x0601 -ffunction-sections -fdata-sections
+# The PE mitigation bits below are header flags and load-time relocations.
+# They execute nothing, so they cost no CPU and stay on.
+WLDFLAGS = -municode -mwindows $(OPT) $(if $(ARCH),-march=$(ARCH)) \
+           -Wl,--gc-sections -s \
            -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
 WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32
 

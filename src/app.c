@@ -405,6 +405,7 @@ static HICON     g_icon_small, g_icon_big;
 static COLORREF  g_icon_color = 0;
 static int       g_tray_added;
 static int       g_filling;
+static bool      g_list_stale;
 static int       g_warned_tray;
 static UINT      g_msg_show;
 static UINT      g_msg_taskbar;
@@ -431,7 +432,12 @@ static COLORREF state_color(const snapshot *s)
 
 static void tray_update(HWND hwnd, const wchar_t *tip)
 {
+    static wchar_t last_tip[128];
     COLORREF c = state_color(g_snap);
+
+    if (g_tray_added && c == g_icon_color && wcsncmp(last_tip, tip, 127) == 0)
+        return; /* nothing the shell would render differently */
+
     if (!g_tray_added || c != g_icon_color) {
         HICON fresh = make_icon(GetSystemMetrics(SM_CXSMICON), c);
         if (fresh) {
@@ -454,6 +460,9 @@ static void tray_update(HWND hwnd, const wchar_t *tip)
 
     if (!g_tray_added) g_tray_added = Shell_NotifyIconW(NIM_ADD, &nid) ? 1 : 0;
     else               Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+    wcsncpy(last_tip, tip, 127);
+    last_tip[127] = L'\0';
 }
 
 static void tray_remove(HWND hwnd)
@@ -663,6 +672,7 @@ static void rescale(HWND hwnd, int dpi, const RECT *suggest)
 
 static void show_main(HWND hwnd)
 {
+    if (g_list_stale) { fill_list(hwnd); g_list_stale = false; }
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
 }
@@ -724,7 +734,10 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         free(g_snap);
         g_snap = fresh;
         CheckDlgButton(hwnd, IDC_ENABLE, g_snap && g_snap->enabled ? BST_CHECKED : BST_UNCHECKED);
-        fill_list(hwnd);
+        /* Rebuilding the list costs a teardown plus five text sets per row.
+         * While we are in the tray nobody can see it, so defer to the reveal. */
+        if (IsWindowVisible(hwnd)) { fill_list(hwnd); g_list_stale = false; }
+        else                         g_list_stale = true;
         update_status(hwnd);
         return TRUE;
     }
