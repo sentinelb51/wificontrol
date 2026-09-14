@@ -12,14 +12,20 @@
 
 static WLAN_INTF_OPCODE opcode_of(wc_opt o)
 {
-    return (o == WC_OPT_BGSCAN) ? wlan_intf_opcode_background_scan_enabled
-                                : wlan_intf_opcode_media_streaming_mode;
+    switch (o) {
+    case WC_OPT_BGSCAN:   return wlan_intf_opcode_background_scan_enabled;
+    case WC_OPT_AUTOCONF: return wlan_intf_opcode_autoconf_enabled;
+    default:              return wlan_intf_opcode_media_streaming_mode;
+    }
 }
 
 static WLAN_SECURABLE_OBJECT securable_of(wc_opt o)
 {
-    return (o == WC_OPT_BGSCAN) ? wlan_secure_bc_scan_enabled
-                                : wlan_secure_media_streaming_mode_enabled;
+    switch (o) {
+    case WC_OPT_BGSCAN:   return wlan_secure_bc_scan_enabled;
+    case WC_OPT_AUTOCONF: return wlan_secure_ac_enabled;
+    default:              return wlan_secure_media_streaming_mode_enabled;
+    }
 }
 
 static wc_ifstate state_of(WLAN_INTERFACE_STATE s)

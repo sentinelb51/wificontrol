@@ -78,6 +78,7 @@ static void fake_init(fake *f, int nifs)
         snprintf(f->ifs[i].name, WC_NAME_MAX, "Adapter %d", i);
         f->val[i][WC_OPT_STREAMING] = 0;              /* OS defaults */
         f->val[i][WC_OPT_BGSCAN]    = f->raw_true;
+        f->val[i][WC_OPT_AUTOCONF]  = f->raw_true;
     }
 }
 
@@ -250,6 +251,103 @@ static void t_access_denied_flags_elevation(void)
     CHECK(wc_write_denied(&s));
 }
 
+/* ---- the nuclear option: disabling WLAN auto config ------------------- */
+
+static void t_nuclear_disables_autoconf(void)
+{
+    printf("arming the nuclear option turns auto config off\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+
+    wc_poll(&s);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);   /* untouched while disarmed */
+
+    wc_set_nuclear(&s, true);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
+    CHECK(s.ad[0].autoconf == WC_VAL_OFF);
+}
+
+static void t_startup_repairs_a_previous_crash(void)
+{
+    /* Auto config does not refcount and does not reset on disconnect, so a
+     * process killed while armed leaves it off for good.  Starting up must
+     * repair that without any record of having caused it. */
+    printf("startup re-enables auto config left off by a dead process\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.val[0][WC_OPT_AUTOCONF] = 0;           /* the wreckage of a previous run */
+
+    wc_poll(&s);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);
+    CHECK(s.recovered == 1);
+    CHECK(s.ad[0].autoconf == WC_VAL_ON);
+}
+
+static void t_disconnect_restores_autoconf(void)
+{
+    /* With auto config off Windows cannot reconnect on its own, so a dropped
+     * link has to put it back immediately or the adapter is stranded. */
+    printf("a dropped link re-enables auto config at once\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+
+    wc_poll(&s);
+    wc_set_nuclear(&s, true);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
+
+    f.ifs[0].state = WC_IF_DISCONNECTED;
+    wc_poll(&s);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);
+    CHECK(s.recovered == 1);
+    CHECK(s.nuclear);                        /* still armed, just not applied */
+
+    f.ifs[0].state = WC_IF_CONNECTED;        /* and it re-arms on reconnect */
+    wc_poll(&s);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
+}
+
+static void t_disarm_and_master_off_restore(void)
+{
+    printf("disarming, and the master switch, both restore auto config\n");
+    fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
+
+    wc_poll(&s);
+    wc_set_nuclear(&s, true);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
+    CHECK(f.val[1][WC_OPT_AUTOCONF] == 0);
+
+    wc_set_nuclear(&s, false);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);
+    CHECK(f.val[1][WC_OPT_AUTOCONF] == 1);
+
+    wc_set_nuclear(&s, true);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
+    wc_set_enabled(&s, false);               /* master off overrides the arm */
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);
+}
+
+static void t_unmanaged_keeps_autoconf(void)
+{
+    printf("an unmanaged adapter never loses auto config\n");
+    fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
+
+    wc_poll(&s);
+    wc_set_managed(&s, 1, false);
+    wc_set_nuclear(&s, true);
+    CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
+    CHECK(f.val[1][WC_OPT_AUTOCONF] == 1);
+}
+
+static void t_autoconf_error_is_not_swallowed(void)
+{
+    printf("a refused auto config write is reported, not lost\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.ifs[0].state = WC_IF_DISCONNECTED;   /* takes an early return path */
+    f.val[0][WC_OPT_AUTOCONF] = 0;
+    f.s_err = WC_E_ACCESS_DENIED;
+
+    wc_poll(&s);
+    CHECK(s.ad[0].last_err == WC_E_ACCESS_DENIED);
+    CHECK(wc_write_denied(&s));
+}
+
 static void t_probe_is_advisory(void)
 {
     printf("a denied probe still lets us try\n");
@@ -275,6 +373,12 @@ int main(void)
     t_managed_flag_survives_unplug();
     t_access_denied_flags_elevation();
     t_probe_is_advisory();
+    t_nuclear_disables_autoconf();
+    t_startup_repairs_a_previous_crash();
+    t_disconnect_restores_autoconf();
+    t_disarm_and_master_off_restore();
+    t_unmanaged_keeps_autoconf();
+    t_autoconf_error_is_not_swallowed();
 
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall checks passed\n");

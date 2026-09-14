@@ -68,6 +68,7 @@ unsigned long wc_refresh(wc_state *s)
             s->ad[j].managed   = true; /* new adapters are managed by default */
             s->ad[j].streaming = WC_VAL_UNKNOWN;
             s->ad[j].bgscan    = WC_VAL_UNKNOWN;
+            s->ad[j].autoconf  = WC_VAL_UNKNOWN;
         }
         memcpy(s->ad[j].name, tmp[i].name, sizeof s->ad[j].name);
         s->ad[j].name[WC_NAME_MAX - 1] = '\0';
@@ -101,6 +102,37 @@ static void apply_opcode(wc_state *s, wc_adapter *a, wc_opt o, int desired, wc_v
     if (cur != desired && !a->last_err) a->last_err = WC_E_VERIFY;
 }
 
+/* Auto config is forced back on unless every condition for keeping it off
+ * holds right now.  Written as a positive check with no memory of what we did
+ * last time: whatever the reason it is off -- the user disarmed, the adapter
+ * dropped, a previous run of this program was killed -- the next pass turns it
+ * back on.  That is the whole recovery mechanism, and it needs no journal.
+ *
+ * Unlike the other two opcodes this one is settable while disconnected, which
+ * is what makes recovery on a dropped link possible at all. */
+static void apply_autoconf(wc_state *s, wc_adapter *a)
+{
+    const bool keep_off = s->enabled && s->nuclear && a->managed &&
+                          a->state == WC_IF_CONNECTED;
+
+    int cur = 0;
+    unsigned long e = s->be.query_bool(s->be.ctx, &a->guid, WC_OPT_AUTOCONF, &cur);
+    if (e != WC_OK) { a->autoconf = WC_VAL_UNKNOWN; if (!a->last_err) a->last_err = e; return; }
+
+    cur = !!cur;
+    a->autoconf = cur ? WC_VAL_ON : WC_VAL_OFF;
+
+    const int desired = keep_off ? 0 : 1;
+    if (cur == desired) return;
+
+    e = s->be.set_bool(s->be.ctx, &a->guid, WC_OPT_AUTOCONF, desired);
+    if (e != WC_OK) { if (!a->last_err) a->last_err = e; return; }
+
+    a->autoconf = desired ? WC_VAL_ON : WC_VAL_OFF;
+    /* Count only repairs, so the UI can say it cleaned up after something. */
+    if (desired) s->recovered++;
+}
+
 void wc_apply_one(wc_state *s, int i)
 {
     if (i < 0 || i >= s->n) return;
@@ -109,10 +141,17 @@ void wc_apply_one(wc_state *s, int i)
 
     const bool want = s->enabled && a->managed;
 
+    /* Cleared once, here, so that an auto config failure below survives every
+     * early return.  apply_opcode keeps the first error rather than the last. */
+    a->last_err = WC_OK;
+
+    /* Runs before every early return: auto config must be repaired even for an
+     * adapter that is disconnected, unmanaged, or switched off. */
+    apply_autoconf(s, a);
+
     /* Nothing to do and nothing to undo. */
     if (!want && !a->touched) {
         a->pending   = false;
-        a->last_err  = WC_OK;
         a->streaming = a->bgscan = WC_VAL_UNKNOWN;
         return;
     }
@@ -123,11 +162,9 @@ void wc_apply_one(wc_state *s, int i)
         a->pending   = want;
         a->touched   = false; /* the disconnect already dropped our request */
         a->streaming = a->bgscan = WC_VAL_UNKNOWN;
-        a->last_err  = WC_OK;
         return;
     }
 
-    a->last_err = WC_OK;
     apply_opcode(s, a, WC_OPT_STREAMING, want ? 1 : 0, &a->streaming);
     apply_opcode(s, a, WC_OPT_BGSCAN,    want ? 0 : 1, &a->bgscan);
 
@@ -146,6 +183,7 @@ void wc_apply_one(wc_state *s, int i)
 
 void wc_apply_all(wc_state *s)
 {
+    s->recovered = 0;
     for (int i = 0; i < s->n; ++i) wc_apply_one(s, i);
 }
 
@@ -160,6 +198,12 @@ unsigned long wc_poll(wc_state *s)
 void wc_set_enabled(wc_state *s, bool on)
 {
     s->enabled = on;
+    wc_apply_all(s);
+}
+
+void wc_set_nuclear(wc_state *s, bool on)
+{
+    s->nuclear = on;
     wc_apply_all(s);
 }
 

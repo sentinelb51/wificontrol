@@ -35,11 +35,23 @@ typedef enum {
     WC_IF_AUTHENTICATING
 } wc_ifstate;
 
-/* The two settings WLAN Optimizer manipulates.  Both are reference-counted by
- * the OS across client handles and are reset automatically when the adapter
- * disconnects, so "restoring" them means writing the opposite value (which
- * withdraws this process's vote) or closing the handle. */
-typedef enum { WC_OPT_STREAMING = 0, WC_OPT_BGSCAN = 1, WC_OPT_COUNT = 2 } wc_opt;
+/* STREAMING and BGSCAN are reference-counted by the OS across client handles
+ * and are reset automatically when the adapter disconnects, so "restoring"
+ * them means writing the opposite value (which withdraws this process's vote)
+ * or closing the handle.
+ *
+ * AUTOCONF is not like that at all.  Nothing refcounts it, nothing resets it
+ * on disconnect, and it survives the process -- the docs call it equivalent to
+ * `netsh wlan setautoconfig`.  Turning it off stops scanning completely, which
+ * also stops roaming and stops Windows reconnecting on its own.  Left off by
+ * a process that died, it stays off.  Every recovery path in this file exists
+ * because of that one asymmetry. */
+typedef enum {
+    WC_OPT_STREAMING = 0,
+    WC_OPT_BGSCAN    = 1,
+    WC_OPT_AUTOCONF  = 2,
+    WC_OPT_COUNT     = 3
+} wc_opt;
 
 typedef enum { WC_VAL_UNKNOWN = -1, WC_VAL_OFF = 0, WC_VAL_ON = 1 } wc_val;
 
@@ -68,6 +80,7 @@ typedef struct {
     bool          pending;      /* wants optimizing but is not connected yet */
     wc_val        streaming;    /* last value read back */
     wc_val        bgscan;
+    wc_val        autoconf;
     unsigned long last_err;     /* WC_OK when the last pass succeeded */
     unsigned      consec_fail;  /* consecutive failed passes; never fatal */
 } wc_adapter;
@@ -75,6 +88,8 @@ typedef struct {
 typedef struct {
     wc_backend    be;
     bool          enabled;                 /* master switch */
+    bool          nuclear;                 /* also disable WLAN auto config */
+    int           recovered;               /* adapters we forced auto config back on */
     wc_adapter    ad[WC_MAX_ADAPTERS];
     int           n;
     bool          can_write[WC_OPT_COUNT]; /* advisory: from WlanGetSecuritySettings */
@@ -88,6 +103,7 @@ void          wc_apply_all   (wc_state *s);
 void          wc_apply_one   (wc_state *s, int i);
 unsigned long wc_poll        (wc_state *s);          /* refresh + apply_all */
 void          wc_set_enabled (wc_state *s, bool on);
+void          wc_set_nuclear (wc_state *s, bool on);
 void          wc_set_managed (wc_state *s, int i, bool on);
 int           wc_find        (const wc_state *s, const wc_guid *g); /* -1 if absent */
 

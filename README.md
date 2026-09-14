@@ -63,6 +63,53 @@ Line references are to `WLANOptimizer.cpp` in the upstream project.
   is refused *even elevated*, it says so and names the likely cause (a group
   policy or a changed Native Wifi DACL) instead of failing silently.
 
+## Stopping all scanning
+
+The **Stop all scanning** checkbox disables Wi-Fi auto configuration
+(`wlan_intf_opcode_autoconf_enabled`). Background scan only asks the driver to
+stop hunting while associated; this stops the WLAN service scanning at all.
+
+It is off by default, asks before arming, and is the one setting here with real
+consequences: **no roaming to a better access point, and no automatic
+reconnect if the link drops.**
+
+It also behaves differently from the other two opcodes in a way that dictates
+the entire design. Background scan and media streaming mode are reference
+counted per client handle and are reset by Windows when the adapter
+disconnects, so they cannot get stuck. Auto config has none of that. Nothing
+refcounts it, nothing resets it, and it outlives the process — the docs call it
+equivalent to `netsh wlan setautoconfig`. Disabled by a program that then dies,
+it stays disabled, across reboots, until something puts it back.
+
+So it is put back:
+
+| When | What happens |
+| --- | --- |
+| The link drops | Re-enabled immediately, so Windows can reconnect |
+| You uncheck it | Re-enabled |
+| The timer expires | Re-enabled, with a notification |
+| The master switch goes off | Re-enabled |
+| The app exits | Re-enabled before the WLAN handle closes |
+| Logging off or shutting down | Re-enabled from `WM_ENDSESSION`, before the reboot |
+| The app starts | Re-enabled if anything left it off |
+
+There is no journal and no record of what it used to be. The rule is a single
+positive condition — keep it off *only* while armed, enabled, managed and
+connected — evaluated against the live value on every pass. Whatever the reason
+it is off, including a previous run of this program that was killed, the next
+pass turns it back on. That is also why the armed state is deliberately **never
+saved to the config file**: the app always starts disarmed, so startup recovery
+is unconditional and there is no stored flag that could be wrong.
+
+The arm is time limited by default (15 minutes, or pick another span, or
+"until I turn it off"), because the realistic failure is not a crash — it is
+arming it and walking away.
+
+The residual risk, stated plainly: if the process is killed outright —
+`TerminateProcess`, a power cut — none of the exit paths run, and auto config
+stays disabled until you next start the app. Starting it fixes the machine.
+Nothing else will.
+
 ## Tuning
 
 The **Tuning...** button opens the settings that actually move Wi-Fi latency,
@@ -194,4 +241,5 @@ instruction it does not have.
 | `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params` |
 | `src/tune_power.c` | the active power scheme, enumerated rather than hardcoded |
 | `src/tune_ui.c` | the tuning dialog |
-| `tests/test_core.c` | regression test per fixed defect |
+| `tests/test_core.c` | regression test per fixed defect and per recovery path |
+| `planned/monitoring.md` | design for the latency/signal monitor; not implemented |

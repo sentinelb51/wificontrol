@@ -35,9 +35,11 @@
 #define WM_W_ENABLE   (WM_APP + 11)
 #define WM_W_MANAGE   (WM_APP + 12)
 #define WM_W_QUIT     (WM_APP + 13)
+#define WM_W_NUCLEAR  (WM_APP + 14)
 
 #define T_DEBOUNCE 1
 #define T_WATCHDOG 2
+#define T_DEADMAN  3
 
 #define DEBOUNCE_MS  250
 #define MIN_POLL_MS 1000
@@ -50,13 +52,14 @@ typedef struct {
     wchar_t       name[WC_NAME_MAX];
     wc_ifstate    state;
     bool          present, managed, pending;
-    wc_val        streaming, bgscan;
+    wc_val        streaming, bgscan, autoconf;
     unsigned long last_err;
 } snap_row;
 
 typedef struct {
     int           n;
-    bool          enabled, write_denied;
+    bool          enabled, write_denied, nuclear;
+    int           recovered;
     unsigned long enum_err, open_err;
     snap_row      row[WC_MAX_ADAPTERS];
 } snapshot;
@@ -262,6 +265,8 @@ static void worker_send_snapshot(void)
 
     s->n          = g_core.n;
     s->enabled    = g_core.enabled;
+    s->nuclear    = g_core.nuclear;
+    s->recovered  = g_core.recovered;
     s->write_denied = wc_write_denied(&g_core);
     s->enum_err   = g_core.enum_err;
     s->open_err   = g_open_err;
@@ -276,6 +281,7 @@ static void worker_send_snapshot(void)
         r->pending   = a->pending;
         r->streaming = a->streaming;
         r->bgscan    = a->bgscan;
+        r->autoconf  = a->autoconf;
         r->last_err  = a->last_err;
         MultiByteToWideChar(CP_UTF8, 0, a->name, -1, r->name, WC_NAME_MAX);
         r->name[WC_NAME_MAX - 1] = L'\0';
@@ -326,6 +332,11 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         worker_send_snapshot();
         return 0;
 
+    case WM_W_NUCLEAR:
+        wc_set_nuclear(&g_core, (int)wp);
+        worker_send_snapshot();
+        return 0;
+
     case WM_W_MANAGE: {
         manage_cmd *c = (manage_cmd *)lp;
         if (c) {
@@ -340,8 +351,14 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_W_QUIT:
         KillTimer(hwnd, T_DEBOUNCE);
         KillTimer(hwnd, T_WATCHDOG);
+        /* Auto config does not come back on its own, so disarm and re-apply
+         * while the handle is still open.  The other two settings need no
+         * such help: closing the handle hands them straight back. */
+        if (g_win32.h) {
+            g_core.nuclear = false;
+            wc_poll(&g_core);
+        }
         wcw_unregister(&g_win32);
-        /* Closing the handle hands both settings back to Windows. */
         wcw_close(&g_win32);
         PostQuitMessage(0);
         return 0;
@@ -407,6 +424,20 @@ static COLORREF  g_icon_color = 0;
 static int       g_tray_added;
 static int       g_filling;
 static bool      g_list_stale;
+static bool      g_nuke_confirmed;   /* asked once per session, not persisted */
+static bool      g_expect_repair;    /* we just disarmed: the next repair is ours */
+
+/* Never written to the config file.  The app always starts disarmed, which is
+ * what makes the first poll repair a previous run that was killed while armed:
+ * there is no stored flag to be wrong about. */
+typedef struct { const wchar_t *label; UINT minutes; } nuke_span;
+static const nuke_span NUKE_FOR[] = {
+    { L"for 15 minutes",      15 },
+    { L"for 5 minutes",        5 },
+    { L"for 30 minutes",      30 },
+    { L"for 1 hour",          60 },
+    { L"until I turn it off",  0 },
+};
 static int       g_warned_tray;
 static UINT      g_msg_show;
 static UINT      g_msg_taskbar;
@@ -422,6 +453,7 @@ static COLORREF state_color(const snapshot *s)
     if (!s || s->open_err || s->enum_err) return RGB(200, 60, 60);
     if (s->write_denied)                  return RGB(214, 152, 32);
     if (!s->enabled)                      return RGB(128, 132, 138);
+    if (s->nuclear)                       return RGB(198, 86, 26); /* armed: unmistakable */
     for (int i = 0; i < s->n; ++i)
         if (s->row[i].present && s->row[i].last_err) return RGB(214, 152, 32);
     for (int i = 0; i < s->n; ++i)
@@ -532,8 +564,9 @@ static void fill_list(HWND hwnd)
             ListView_SetItemText(lv, row, 1, buf);
             ListView_SetItemText(lv, row, 2, (LPWSTR)val_text(r->bgscan));
             ListView_SetItemText(lv, row, 3, (LPWSTR)val_text(r->streaming));
+            ListView_SetItemText(lv, row, 4, (LPWSTR)val_text(r->autoconf));
             row_status(r, g_snap->enabled, buf, 256);
-            ListView_SetItemText(lv, row, 4, buf);
+            ListView_SetItemText(lv, row, 5, buf);
             ListView_SetCheckState(lv, row, r->managed ? TRUE : FALSE);
         }
     }
@@ -568,6 +601,10 @@ static void update_status(HWND hwnd)
         }
         if (!g_snap->enabled)
             wcscpy(text, L"Off. Windows defaults are in effect.");
+        else if (g_snap->nuclear)
+            _snwprintf(text, 512, L"Scanning stopped on %d adapter%s. No roaming and no "
+                                  L"automatic reconnect while this is on.",
+                       active, active == 1 ? L"" : L"s");
         else if (active || waiting)
             _snwprintf(text, 512, L"Optimizing %d adapter%s%s. Settings are released "
                                   L"automatically when this app exits.",
@@ -576,9 +613,66 @@ static void update_status(HWND hwnd)
         else
             wcscpy(text, L"No connected Wi-Fi adapter to optimize yet.");
     }
+    /* A repair while armed is the expected reaction to a dropped link, and one
+     * straight after disarming is our own doing.  Anything else means we found
+     * auto config switched off by a run that never got to clean up. */
+    bool foreign_repair = g_snap && g_snap->recovered > 0 && !g_snap->nuclear &&
+                          !g_expect_repair;
+    if (g_snap && g_snap->recovered > 0) g_expect_repair = false;
+
+    wchar_t note[256] = L"";
+    if (foreign_repair) {
+        _snwprintf(note, 256, L"Re-enabled Wi-Fi auto configuration on %d adapter%s "
+                              L"that had been left disabled.",
+                   g_snap->recovered, g_snap->recovered == 1 ? L"" : L"s");
+        note[255] = L'\0';
+        wcsncpy(text, note, 511);
+    }
     text[511] = L'\0';
     SetDlgItemTextW(hwnd, IDC_STATUS, text);
     tray_update(hwnd, text);
+    /* After tray_update, so the icon exists to hang it on at startup. */
+    if (note[0]) tray_balloon(hwnd, L"WiFi Control", note);
+}
+
+static void arm_deadman(HWND hwnd)
+{
+    KillTimer(hwnd, T_DEADMAN);
+    int k = (int)SendMessageW(GetDlgItem(hwnd, IDC_NUKE_FOR), CB_GETCURSEL, 0, 0);
+    if (k < 0 || k >= (int)(sizeof NUKE_FOR / sizeof NUKE_FOR[0])) k = 0;
+    UINT minutes = NUKE_FOR[k].minutes;
+    if (minutes) SetTimer(hwnd, T_DEADMAN, minutes * 60u * 1000u, nullptr);
+}
+
+static void set_nuclear(HWND hwnd, bool on)
+{
+    CheckDlgButton(hwnd, IDC_NUKE, on ? BST_CHECKED : BST_UNCHECKED);
+    EnableWindow(GetDlgItem(hwnd, IDC_NUKE_FOR), !on);
+    if (on) {
+        arm_deadman(hwnd);
+    } else {
+        KillTimer(hwnd, T_DEADMAN);
+        /* The repair this triggers is expected, so do not report it as having
+         * cleaned up after something. */
+        g_expect_repair = true;
+    }
+    PostMessageW(g_worker, WM_W_NUCLEAR, (WPARAM)on, 0);
+}
+
+static bool confirm_nuclear(HWND hwnd)
+{
+    if (g_nuke_confirmed) return true;
+    int r = MessageBoxW(hwnd,
+        L"Disable Wi-Fi auto configuration on the checked adapters?\n\n"
+        L"This stops scanning completely, which is the point \u2014 but it also stops "
+        L"roaming to a better access point, and stops Windows reconnecting on its "
+        L"own if the link drops.\n\n"
+        L"It is put back automatically when the link drops, when you turn this off, "
+        L"when the timer expires, and when this app exits or next starts. If the app "
+        L"is killed outright, it stays off until you run it again.",
+        L"Stop all scanning", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+    g_nuke_confirmed = (r == IDYES);
+    return g_nuke_confirmed;
 }
 
 static void send_manage(const wc_guid *g, bool on)
@@ -642,8 +736,8 @@ static void apply_font(HWND hwnd, int dpi)
 static void layout_columns(HWND hwnd, int dpi)
 {
     HWND lv = GetDlgItem(hwnd, IDC_LIST);
-    static constexpr int w[5] = { 150, 74, 52, 52, 150 };
-    for (int i = 0; i < 5; ++i) ListView_SetColumnWidth(lv, i, MulDiv(w[i], dpi, 96));
+    static constexpr int w[6] = { 150, 74, 52, 52, 52, 150 };
+    for (int i = 0; i < 6; ++i) ListView_SetColumnWidth(lv, i, MulDiv(w[i], dpi, 96));
 }
 
 /* Children were cached at g_base_dpi, not at 96: a dialog template is laid out
@@ -710,8 +804,9 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND lv = GetDlgItem(hwnd, IDC_LIST);
         ListView_SetExtendedListViewStyle(lv, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT |
                                               LVS_EX_DOUBLEBUFFER);
-        static const wchar_t *cols[5] = { L"Adapter", L"State", L"Bkg scan", L"Streaming", L"Status" };
-        for (int i = 0; i < 5; ++i) {
+        static const wchar_t *cols[6] = { L"Adapter", L"State", L"Bkg scan",
+                                          L"Streaming", L"Auto cfg", L"Status" };
+        for (int i = 0; i < 6; ++i) {
             LVCOLUMNW c;
             memset(&c, 0, sizeof c);
             c.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -720,6 +815,11 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             c.cx       = 100;
             ListView_InsertColumn(lv, i, &c);
         }
+
+        HWND nf = GetDlgItem(hwnd, IDC_NUKE_FOR);
+        for (size_t k = 0; k < sizeof NUKE_FOR / sizeof NUKE_FOR[0]; ++k)
+            SendMessageW(nf, CB_ADDSTRING, 0, (LPARAM)NUKE_FOR[k].label);
+        SendMessageW(nf, CB_SETCURSEL, 0, 0);
 
         g_icon_big = make_icon(GetSystemMetrics(SM_CXICON), RGB(43, 145, 72));
         if (g_icon_big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon_big);
@@ -773,6 +873,7 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_ENABLE: {
             bool on = IsDlgButtonChecked(hwnd, IDC_ENABLE) == BST_CHECKED;
             cfg_save_enabled(on);
+            if (!on) set_nuclear(hwnd, false); /* the core ignores it anyway; say so */
             PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
             return TRUE;
         }
@@ -781,6 +882,12 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             CheckDlgButton(hwnd, IDC_ENABLE, on ? BST_CHECKED : BST_UNCHECKED);
             cfg_save_enabled(on);
             PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
+            return TRUE;
+        }
+        case IDC_NUKE: {
+            bool on = IsDlgButtonChecked(hwnd, IDC_NUKE) == BST_CHECKED;
+            if (on && !confirm_nuclear(hwnd)) { set_nuclear(hwnd, false); return TRUE; }
+            set_nuclear(hwnd, on);
             return TRUE;
         }
         case IDC_REFRESH:
@@ -823,6 +930,25 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return TRUE;
         }
         return FALSE;
+
+    case WM_TIMER:
+        if (wp == T_DEADMAN) {
+            KillTimer(hwnd, T_DEADMAN);
+            set_nuclear(hwnd, false);
+            tray_balloon(hwnd, L"WiFi Control",
+                         L"Timer expired \u2014 scanning and auto configuration are back on.");
+        }
+        return TRUE;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        /* Logging off or shutting down: WM_DESTROY is not guaranteed to run,
+         * and auto config would survive the reboot still disabled.  Send, not
+         * post, so the worker has actually written it before we return. */
+        if (wp && g_worker) SendMessageW(g_worker, WM_W_NUCLEAR, 0, 0);
+        return TRUE;
 
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_MINIMIZE) { ShowWindow(hwnd, SW_HIDE); return TRUE; }

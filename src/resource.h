@@ -4,6 +4,8 @@
 #define IDC_STATUS   1003
 #define IDC_REFRESH  1004
 #define IDC_TUNE     1005
+#define IDC_NUKE     1006
+#define IDC_NUKE_FOR 1007
 
 #define IDD_TUNE      200
 #define IDC_TUNE_FOR 2001
