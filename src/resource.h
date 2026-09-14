@@ -1,0 +1,19 @@
+#define IDD_MAIN      100
+#define IDC_ENABLE   1001
+#define IDC_LIST     1002
+#define IDC_STATUS   1003
+#define IDC_REFRESH  1004
+#define IDC_TUNE     1005
+#define IDC_NUKE     1006
+#define IDC_NUKE_FOR 1007
+
+#define IDD_TUNE      200
+#define IDC_TUNE_FOR 2001
+#define IDC_TUNE_LIST 2002
+#define IDC_TUNE_VAL  2003
+#define IDC_TUNE_HINT 2004
+#define IDC_TUNE_APPLY 2005
+#define IDC_TUNE_RESTART 2006
+#define IDM_SHOW    40001
+#define IDM_TOGGLE  40002
+#define IDM_EXIT    40003

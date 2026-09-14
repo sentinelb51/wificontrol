@@ -1,0 +1,81 @@
+# WiFi Control -- cross-built for Windows from any host with mingw-w64,
+# with the policy core unit-tested natively.
+#
+#   make            build build/wificontrol.exe
+#   make test       build and run the core tests on this host
+#   make clean
+
+CROSS   ?= x86_64-w64-mingw32-
+WINCC    = $(CROSS)gcc
+WINDRES  = $(CROSS)windres
+CC      ?= cc
+BUILD   ?= build
+
+# Newest C standard each compiler accepts.  GCC only learned the -std=c23
+# spelling in 14; 13 and earlier want -std=c2x for the same language.
+newest_std = $(shell for s in c23 c2x c17 c11; do \
+               $(1) -std=$$s -fsyntax-only -x c /dev/null >/dev/null 2>&1 && { echo $$s; break; }; done)
+STD      ?= $(call newest_std,$(WINCC))
+HOSTSTD  ?= $(call newest_std,$(CC))
+
+WARN     = -Wall -Wextra -Werror
+
+# Nothing that puts instructions on the hot path: no stack canary load and
+# compare per frame, no endbr64 at every indirect branch target.
+OPT     ?= -O3 -flto=auto -fuse-linker-plugin -fno-ident \
+           -fno-stack-protector -fcf-protection=none
+
+# Baseline is plain x86-64 so the binary runs anywhere.  ARCH=x86-64-v2
+# (SSE4.2, ~2009+) or x86-64-v3 (AVX2, ~2013+) if you only target your own
+# machines -- an older CPU faults on an unsupported instruction.
+ARCH    ?=
+
+WCFLAGS  = -std=$(STD) $(WARN) $(OPT) $(if $(ARCH),-march=$(ARCH)) \
+           -municode -D_WIN32_WINNT=0x0601 -ffunction-sections -fdata-sections
+# The PE mitigation bits below are header flags and load-time relocations.
+# They execute nothing, so they cost no CPU and stay on.
+WLDFLAGS = -municode -mwindows $(OPT) $(if $(ARCH),-march=$(ARCH)) \
+           -Wl,--gc-sections -s \
+           -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
+WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32 \
+           -lsetupapi -lpowrprof -ladvapi32 -luuid
+
+WSRC     = src/app.c src/wlan_core.c src/wlan_win32.c \
+           src/tune.c src/tune_driver.c src/tune_power.c src/tune_ui.c
+WOBJ     = $(patsubst src/%.c,$(BUILD)/%.o,$(WSRC)) $(BUILD)/app.res.o
+
+TESTBIN  = $(BUILD)/test_core
+TESTFLAGS= -std=$(HOSTSTD) $(WARN) -g -fsanitize=address,undefined
+
+.PHONY: all test clean
+all: $(BUILD)/wificontrol.exe
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+$(BUILD)/%.o: src/%.c | $(BUILD)
+	$(WINCC) $(WCFLAGS) -c $< -o $@
+
+$(BUILD)/app.res.o: src/app.rc src/resource.h src/app.manifest | $(BUILD)
+	$(WINDRES) -I src $< -o $@
+
+$(BUILD)/wificontrol.exe: $(WOBJ)
+	$(WINCC) $(WOBJ) -o $@ $(WLDFLAGS) $(WLIBS)
+	@echo "built $@ with -std=$(STD) ($$(stat -c %s $@ 2>/dev/null || stat -f %z $@) bytes)"
+
+test: $(TESTBIN)
+	./$(TESTBIN)
+
+$(TESTBIN): tests/test_core.c src/wlan_core.c src/wlan.h | $(BUILD)
+	$(CC) $(TESTFLAGS) tests/test_core.c src/wlan_core.c -o $@
+
+clean:
+	rm -rf $(BUILD)
+
+$(BUILD)/app.o:        src/wlan.h src/wlan_win32.h src/resource.h
+$(BUILD)/wlan_core.o:  src/wlan.h
+$(BUILD)/wlan_win32.o: src/wlan.h src/wlan_win32.h
+$(BUILD)/tune.o:        src/tune.h src/wlan.h
+$(BUILD)/tune_driver.o: src/tune.h src/wlan.h src/wlan_win32.h
+$(BUILD)/tune_power.o:  src/tune.h src/wlan.h
+$(BUILD)/tune_ui.o:     src/tune.h src/wlan.h src/wlan_win32.h src/resource.h
