@@ -303,3 +303,12 @@ void ui_text(ui_canvas *c, HFONT f, COLORREF col, const wchar_t *s,
     DrawTextW(c->dc, s, -1, &r, fmt | DT_NOPREFIX);
     SelectObject(c->dc, old);
 }
+
+int ui_text_w(ui_canvas *c, HFONT f, const wchar_t *s)
+{
+    HGDIOBJ old = SelectObject(c->dc, f);
+    SIZE sz = { 0, 0 };
+    GetTextExtentPoint32W(c->dc, s, (int)wcslen(s), &sz);
+    SelectObject(c->dc, old);
+    return sz.cx;
+}

@@ -51,6 +51,7 @@ void ui_ring (ui_canvas *c, double x0, double y0, double x1, double y1, double r
 void ui_line(ui_canvas *c, double x0, double y0, double x1, double y1, double w, COLORREF col);
 void ui_text (ui_canvas *c, HFONT f, COLORREF col, const wchar_t *s,
               int x0, int y0, int x1, int y1, UINT fmt);
+int  ui_text_w(ui_canvas *c, HFONT f, const wchar_t *s);
 COLORREF ui_mix(COLORREF a, COLORREF b, double t);
 
 /* Owner-drawn buttons.  The parent forwards WM_DRAWITEM to ui_draw_item and

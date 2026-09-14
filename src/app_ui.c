@@ -172,15 +172,6 @@ static void row_status(const snap_row *r, bool enabled, wchar_t *out, int cap)
     out[cap - 1] = L'\0';
 }
 
-static int text_w(ui_canvas *c, HFONT f, const wchar_t *s)
-{
-    HGDIOBJ old = SelectObject(c->dc, f);
-    SIZE sz = { 0, 0 };
-    GetTextExtentPoint32W(c->dc, s, (int)wcslen(s), &sz);
-    SelectObject(c->dc, old);
-    return sz.cx;
-}
-
 static COLORREF state_ink(const snap_row *r)
 {
     if (!r->present) return ui_pal.text2;
@@ -211,7 +202,7 @@ static void paint_card(ui_canvas *c, const snap_row *r, int y)
     /* Header: name on the left, a coloured dot and the link state on the right. */
     wchar_t state[64] = L"Not present";
     if (r->present) MultiByteToWideChar(CP_UTF8, 0, wc_state_name(r->state), -1, state, 64);
-    const int sw = text_w(c, g_f.body, state), dot = P(8);
+    const int sw = ui_text_w(c, g_f.body, state), dot = P(8);
     ui_text(c, g_f.body, ui_pal.text2, state, right - sw, y + P(12), right, y + P(36), one);
     const double dx = right - sw - P(8) - dot / 2.0, dy = y + P(24);
     ui_rrect(c, dx - dot / 2.0, dy - dot / 2.0, dx + dot / 2.0, dy + dot / 2.0, dot / 2.0,
@@ -238,7 +229,7 @@ static void paint_card(ui_canvas *c, const snap_row *r, int y)
     row_status(r, g_snap->enabled, status, 256);
     const COLORREF ink = r->last_err ? ui_pal.err : row_optimized(r) ? ui_pal.ok : ui_pal.text2;
     const int fy = y + P(CARD_FOOT), sx = right - P(SWITCH_W);
-    const int lw = text_w(c, g_f.body, L"Manage");
+    const int lw = ui_text_w(c, g_f.body, L"Manage");
     ui_fill(c, in, fy - P(4), right, fy - P(4) + (P(1) > 0 ? P(1) : 1), ui_pal.border);
     ui_text(c, g_f.body, ui_pal.text2, L"Manage", sx - P(6) - lw, fy, sx - P(6), fy + P(ROW_H), one);
     ui_text(c, g_f.body, ink, status, in, fy, sx - lw - P(20), fy + P(ROW_H), one);

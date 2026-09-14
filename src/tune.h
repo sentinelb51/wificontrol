@@ -33,6 +33,7 @@ typedef struct {
     int         n_opt;
     int         cur;    /* index into opt of the live value, -1 if unrecognised */
     int         sel;    /* index the user has chosen; equals cur until they act */
+    const wchar_t *help; /* one line on what the setting does, or nullptr if unknown */
 
     /* provider-private addressing */
     wchar_t     value_name[TUNE_KEY_MAX]; /* driver: registry value under the instance key */

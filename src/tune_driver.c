@@ -15,6 +15,70 @@
 static const wchar_t *CLASS_NET =
     L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}";
 
+/* One line on what a well-known property does: what changing it does to the
+ * radio or the link, never which choice to make.  Keyed by registry keyword,
+ * not ParamDesc, which the INF may translate.  Starred keywords are Microsoft's
+ * standardized ones and mean the same on any vendor's card; the rest are the
+ * names Intel's driver uses.  A property not listed simply has no line. */
+static const struct { const wchar_t *keyword, *help; } KNOWN[] = {
+    { L"*PacketCoalescing",
+      L"Batches received broadcast and multicast frames into fewer interrupts; they arrive later." },
+    { L"*SelectiveSuspend",
+      L"NDIS suspends the adapter after a few idle seconds; the next packet waits for it to resume." },
+    { L"*DeviceSleepOnDisconnect",
+      L"With no link, the adapter drops to low power (D3) and returns to full power on reconnect." },
+    { L"*PMARPOffload",
+      L"While the PC sleeps, the adapter answers IPv4 ARP requests itself instead of waking it." },
+    { L"*PMNSOffload",
+      L"While the PC sleeps, the adapter answers IPv6 neighbor solicitations itself instead of waking it." },
+    { L"*PMWiFiRekeyOffload",
+      L"While the PC sleeps, the adapter completes group key (GTK) rekeys itself to stay associated." },
+    { L"*WakeOnMagicPacket",
+      L"A magic packet (this adapter's MAC address repeated 16 times) wakes the PC from sleep." },
+    { L"*ModernStandbyWoLMagicPacket",
+      L"A magic packet wakes the PC from modern standby (S0ix); hibernation is not affected." },
+    { L"*WakeOnPattern",
+      L"Packets matching patterns Windows registers, such as an incoming TCP SYN, wake the PC." },
+
+    { L"BgScanGlobalBlocking",
+      L"Blocks background scans while connected: Never, only while the signal is good, or Always." },
+    { L"RoamAggressiveness",
+      L"Signal level at which the adapter starts scanning for a better AP; higher scans sooner." },
+    { L"RoamingPreferredBandType",
+      L"Biases AP selection and roaming toward the chosen band; other bands stay usable." },
+    { L"ChannelWidth24",
+      L"Auto follows the AP up to 40 MHz; 20 MHz only never bonds channels, capping peak rate." },
+    { L"ChannelWidth52",
+      L"Auto follows the AP up to 160 MHz; 20 MHz only never bonds channels, capping peak rate." },
+    { L"ChannelWidth6",
+      L"Auto follows the AP's channel width; 20 MHz only never bonds channels, capping peak rate." },
+    { L"FatChannelIntolerant",
+      L"Sets the 40 MHz Intolerant bit, asking nearby 2.4 GHz networks to use 20 MHz channels." },
+    { L"CtsToItself",
+      L"Airtime reservation with 802.11b nearby: RTS/CTS covers hidden nodes, CTS-to-self costs less." },
+    { L"IEEE11nMode",
+      L"Newest PHY used: 802.11n (HT), ac (VHT) or ax (HE); Disabled limits the link to a/b/g rates." },
+    { L"WirelessMode",
+      L"Which 802.11a/b/g modes, and so which bands, are allowed: a is 5 GHz, b and g are 2.4 GHz." },
+    { L"Is6GhzBandSupported",
+      L"Whether the adapter scans and connects on the 6 GHz band (Wi-Fi 6E) at all." },
+    { L"MIMOPowerSaveMode",
+      L"Receive chains kept on: No SMPS all, Dynamic one until the AP sends RTS, Static only one." },
+    { L"uAPSDSupport",
+      L"WMM Power Save: while dozing, the AP holds frames until the adapter sends a trigger frame." },
+    { L"ThroughputBoosterEnabled",
+      L"Holds the medium longer to burst buffered uplink frames; upload only, at others' airtime." },
+    { L"IbssTxPower",
+      L"Radio transmit power; lower shrinks range and the signal strength the AP receives." },
+};
+
+static const wchar_t *known_help(const wchar_t *keyword)
+{
+    for (size_t i = 0; i < sizeof KNOWN / sizeof KNOWN[0]; ++i)
+        if (_wcsicmp(KNOWN[i].keyword, keyword) == 0) return KNOWN[i].help;
+    return nullptr;
+}
+
 static bool reg_str(HKEY key, const wchar_t *name, wchar_t *out, DWORD chars)
 {
     DWORD type = 0, bytes = chars * sizeof(wchar_t);
@@ -160,6 +224,7 @@ void tune_collect_driver(tune_list *l, const wc_guid *adapter)
         }
         wcsncpy(s->value_name, pname, TUNE_KEY_MAX - 1);
         s->value_name[TUNE_KEY_MAX - 1] = L'\0';
+        s->help = known_help(pname);
 
         /* Live value, else the driver's declared default. */
         wchar_t live[TUNE_KEY_MAX] = L"";

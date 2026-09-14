@@ -24,6 +24,7 @@
 enum {
     CLIENT_W = 600, PAD = 16, TITLE_H = 48, FOOT_H = 86, VIEW_MAX = 460,
     SECTION_H = 36, ROW_H = 44, HINT_H = 40, COMBO_W = 240,
+    HELP_ROW_H = 62, HEAD_H = 42, HELP_Y = 36, HELP_H = 18,
     POWER_ROW_H = 84, POWER_COMBOS_Y = 48, POWER_LABEL_W = 74, POWER_COMBO_W = 170,
     BUTTON_W = 88, BUTTON_H = 30, RESTART_W = 124,
 };
@@ -41,6 +42,7 @@ typedef struct {
     HWND       dlg, panel;
     trow       driver[TUNE_MAX_SETTINGS], power[TUNE_MAX_SETTINGS];
     int        n_driver, n_power;
+    int        driver_y[TUNE_MAX_SETTINGS + 1]; /* each adapter row's offset below driver_top */
     int        driver_top, driver_hint, power_top, power_hint, content;
     wchar_t    status[256];
     bool       status_err;
@@ -68,6 +70,11 @@ static bool row_pending(const tune_list *l, trow r)
     }
     return false;
 }
+
+/* An adapter row with a description keeps its name and dropdown in a band at
+ * the top and gives the description its own line underneath. */
+static int row_h (const tune_ctx *t, const tune_setting *s) { return P(s->help ? HELP_ROW_H : ROW_H); }
+static int head_h(const tune_ctx *t, const tune_setting *s) { return P(s->help ? HEAD_H : ROW_H); }
 
 /* ------------------------------------------------------------------ paint */
 
@@ -108,12 +115,15 @@ static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll
                 in, y, right, y + P(ROW_H), one);
     }
     for (int k = 0; k < t->n_driver; ++k) {
-        const int ry = y + k * P(ROW_H);
+        const int ry = y + t->driver_y[k];
         const tune_setting *s = &l->s[t->driver[k].ac];
         if (k) paint_rule(t, cv, ry);
-        if (row_pending(l, t->driver[k])) paint_marker(t, cv, ry, ry + P(ROW_H));
+        if (row_pending(l, t->driver[k])) paint_marker(t, cv, ry, y + t->driver_y[k + 1]);
         ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry, right - P(COMBO_W) - P(12),
-                ry + P(ROW_H), one);
+                ry + head_h(t, s), one);
+        if (s->help)
+            ui_text(cv, t->f.small, ui_pal.text2, s->help, in, ry + P(HELP_Y), right,
+                    ry + P(HELP_Y + HELP_H), one);
     }
     y = t->driver_hint - scroll;
     ui_text(cv, t->f.small, ui_pal.text2,
@@ -134,8 +144,16 @@ static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll
         const tune_setting *s = &l->s[t->power[k].ac >= 0 ? t->power[k].ac : t->power[k].dc];
         if (k) paint_rule(t, cv, ry);
         if (row_pending(l, t->power[k])) paint_marker(t, cv, ry, ry + P(POWER_ROW_H));
-        ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry + P(10), right, ry + P(30), one);
-        ui_text(cv, t->f.small, ui_pal.text2, s->group, in, ry + P(28), right, ry + P(46), one);
+        /* The group goes at the right of the name, leaving the second line to
+         * the description. */
+        int gw = ui_text_w(cv, t->f.small, s->group);
+        if (gw > (right - in) / 2) gw = (right - in) / 2;
+        ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry + P(10), right - gw - P(12),
+                ry + P(30), one);
+        ui_text(cv, t->f.small, ui_pal.text2, s->group, right - gw, ry + P(10), right,
+                ry + P(30), one | DT_RIGHT);
+        if (s->help)
+            ui_text(cv, t->f.small, ui_pal.text2, s->help, in, ry + P(28), right, ry + P(46), one);
 
         /* Two dropdowns, because Windows keeps the two values separately. */
         const int cy = ry + P(POWER_COMBOS_Y);
@@ -229,8 +247,11 @@ static void place(HWND w, int x, int y, int cw, int ch)
 
 static void layout(tune_ctx *t, const RECT *at)
 {
+    t->driver_y[0] = 0;
+    for (int k = 0; k < t->n_driver; ++k)
+        t->driver_y[k + 1] = t->driver_y[k] + row_h(t, &t->list->s[t->driver[k].ac]);
     t->driver_top  = P(SECTION_H);
-    t->driver_hint = t->driver_top + (t->n_driver ? t->n_driver : 1) * P(ROW_H);
+    t->driver_hint = t->driver_top + (t->n_driver ? t->driver_y[t->n_driver] : P(ROW_H));
     t->power_top   = t->driver_hint + P(HINT_H) + P(SECTION_H);
     t->power_hint  = t->power_top + (t->n_power ? t->n_power * P(POWER_ROW_H) : P(ROW_H));
     t->content     = t->power_hint + P(HINT_H);
@@ -259,9 +280,9 @@ static void layout(tune_ctx *t, const RECT *at)
     }
 
     for (int k = 0; k < t->n_driver; ++k) {
-        const int ry = t->driver_top + k * P(ROW_H) - scroll;
+        const int ry = t->driver_top + t->driver_y[k] - scroll;
         place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver[k].ac), right - P(COMBO_W),
-              ry + (P(ROW_H) - combo_h) / 2, P(COMBO_W), P(300));
+              ry + (head_h(t, &l->s[t->driver[k].ac]) - combo_h) / 2, P(COMBO_W), P(300));
     }
     const int in   = P(PAD) + P(14);
     const int ac_x = in + P(POWER_LABEL_W);

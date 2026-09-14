@@ -126,6 +126,13 @@ declares, and the rules are the same throughout:
   aggressiveness, power save mode, scan-when-associated, throughput booster --
   appears under the name the driver gives it. Properties that are a numeric
   range rather than a list of choices are left out; they are not dropdowns.
+- **A line on what a well-known setting does.** Microsoft's standardized
+  keywords (packet coalescing, ARP/NS offload, wake on pattern, selective
+  suspend...), Intel's own properties and both power settings carry a
+  one-line technical note: what changing the value does to the radio or the
+  link, never which value to pick. Notes are matched on the registry keyword,
+  not the display name, so a translated driver still gets them. A property the
+  app does not know is shown without one.
 - **Only the power settings on the Wi-Fi path.** Wireless Adapter Settings \
   Power Saving Mode, and PCI Express \ Link State Power Management, which is
   what lets an internal Wi-Fi card's link doze between packets. Display,
@@ -251,7 +258,7 @@ instruction it does not have.
 | `src/app_ui.c` | the main window: switches, adapter cards, tray |
 | `src/ui.h`, `src/ui_draw.c`, `src/ui_ctl.c` | theme, anti-aliased drawing, owner-drawn switches and buttons, scrolling panel |
 | `src/tune.h`, `src/tune.c` | the settings model, and writing only what changed |
-| `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params` |
+| `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params`, and notes on well-known ones |
 | `src/tune_power.c` | the two Wi-Fi-path power settings in the active scheme |
 | `src/tune_ui.c` | the tuning window |
 | `tests/test_core.c` | regression test per fixed defect and per recovery path |
