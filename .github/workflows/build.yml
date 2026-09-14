@@ -3,26 +3,81 @@ name: build
 on:
   push:
     branches: ["**"]
+    paths-ignore: ["**.md", "planned/**"]
   pull_request:
+    paths-ignore: ["**.md", "planned/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref makes an in-flight run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Arch is rolling, so pacman serves the newest GCC and mingw-w64 as soon
+    # as they ship.  Ubuntu's mingw-w64 is several major versions behind.
+    container: archlinux:latest
+    env:
+      TOOLCHAIN: gcc make mingw-w64-gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Install mingw-w64
+      - name: Resolve the newest toolchain
+        id: toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64-win32 binutils-mingw-w64-x86-64
+          pacman -Sy --noconfirm
+          # The exact package versions this run would download.  The cache
+          # key changes when, and only when, one of them is updated.
+          pkgs=$(pacman -Sup --needed --print-format '%n-%v' $TOOLCHAIN | sort)
+          echo "$pkgs"
+          echo "key=pacman-$(sha256sum <<< "$pkgs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache toolchain packages
+        uses: actions/cache@v6
+        with:
+          path: /var/cache/pacman/pkg
+          key: ${{ steps.toolchain.outputs.key }}
+          # A near miss still restores most packages; pacman fetches the rest.
+          restore-keys: pacman-
+
+      - name: Install the toolchain
+        run: |
+          pacman -Su --needed --noconfirm $TOOLCHAIN
+          # Drop superseded versions so the saved cache does not grow forever.
+          pacman -Sc --noconfirm
+          echo "mingw-w64 gcc $(x86_64-w64-mingw32-gcc -dumpfullversion), host gcc $(gcc -dumpfullversion)"
 
       - name: Unit-test the policy core
-        run: make test
+        run: make -j"$(nproc)" test
 
       - name: Cross-build the Windows binary
-        run: make
+        run: make -j"$(nproc)"
 
-      - uses: actions/upload-artifact@v4
+      - name: Check it needs nothing beyond Windows
+        run: |
+          dlls=$(x86_64-w64-mingw32-objdump -p build/wificontrol.exe | sed -n 's/^[[:space:]]*DLL Name: //p' | sort -u)
+          echo "$dlls"
+          # mingw runtime DLLs (libwinpthread-1, libgcc_s_seh-1, ...) do not ship with Windows.
+          if grep -i '^lib' <<< "$dlls"; then
+            echo "::error title=wificontrol.exe::imports a mingw runtime DLL"
+            exit 1
+          fi
+          echo "::notice title=wificontrol.exe::$(stat -c %s build/wificontrol.exe) bytes, mingw-w64 gcc $(x86_64-w64-mingw32-gcc -dumpfullversion), imports: $(paste -sd' ' <<< "$dlls")"
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: wificontrol
           path: build/wificontrol.exe
+          archive: false
+          if-no-files-found: error
