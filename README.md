@@ -65,7 +65,7 @@ Line references are to `WLANOptimizer.cpp` in the upstream project.
 
 ## Stopping all scanning
 
-The **Stop all scanning** checkbox disables Wi-Fi auto configuration
+The **Stop scanning** switch disables Wi-Fi auto configuration
 (`wlan_intf_opcode_autoconf_enabled`). Background scan only asks the driver to
 stop hunting while associated; this stops the WLAN service scanning at all.
 
@@ -86,7 +86,7 @@ So it is put back:
 | When | What happens |
 | --- | --- |
 | The link drops | Re-enabled immediately, so Windows can reconnect |
-| You uncheck it | Re-enabled |
+| You switch it off | Re-enabled |
 | The timer expires | Re-enabled, with a notification |
 | The master switch goes off | Re-enabled |
 | The app exits | Re-enabled before the WLAN handle closes |
@@ -121,21 +121,25 @@ declares, and the rules are the same throughout:
 
 - **Nothing is automatic.** The app never picks a value, never recommends one,
   and never applies anything on its own. You choose, you press Apply.
-- **Nothing is hardcoded.** Adapter properties come from the driver's own
+- **Adapter properties come from the driver.** They are read from its own
   `Ndi\Params` metadata, so whatever your card exposes -- roaming
   aggressiveness, power save mode, scan-when-associated, throughput booster --
-  appears under the name the driver gives it. Power settings are enumerated
-  from the active scheme, subgroup by subgroup, so no setting GUID is baked in
-  and nothing is missed. Settings that are a numeric range rather than a list
-  of choices are left out; they are not dropdowns.
+  appears under the name the driver gives it. Properties that are a numeric
+  range rather than a list of choices are left out; they are not dropdowns.
+- **Only the power settings on the Wi-Fi path.** Wireless Adapter Settings \
+  Power Saving Mode, and PCI Express \ Link State Power Management, which is
+  what lets an internal Wi-Fi card's link doze between packets. Display,
+  processor, GPU and battery policy is not shown. Windows marks ASPM hidden;
+  it is listed anyway. A setting this machine does not have is simply absent.
 - **No before/after tracking, no undo journal.** The registry and the power
   scheme are the state. Nothing is recorded anywhere about what a value used to
   be. To undo a change, pick the other entry in the same dropdown.
 - **Only what you changed is written.** Untouched dropdowns are not rewritten.
 
-Power settings are listed twice, once for **plugged in** and once for **on
-battery**, because Windows stores them separately and writing one would say
-nothing about the other. They take effect immediately.
+Each power setting has two dropdowns, **plugged in** and **on battery**,
+because Windows stores them separately and writing one would say nothing about
+the other. They take effect immediately. A row you have changed is marked, and
+Apply stays disabled until something has been.
 
 Adapter properties do not: the miniport reads them when it starts, so a change
 sits in the registry until the device restarts. **Restart adapter** does that
@@ -176,10 +180,17 @@ two opcodes is gated by the Native Wifi securable objects and a standard user
 is normally refused. So there is **one UAC prompt each time it starts**, and no
 permission problems after that.
 
-Run it. Adapters are listed with a checkbox each; uncheck one to leave it
-alone. The master checkbox turns everything off and hands the settings back
-without quitting. Closing the window hides it to the tray — the settings only
-last while the process is alive — and Exit in the tray menu really quits.
+Run it. Each adapter gets a card showing its connection and what the driver
+reported back for each setting, ticked where it matches what was asked for;
+switch **Manage** off on a card to leave that adapter alone. **Optimize** turns
+everything off and hands the settings back without quitting. Closing the window
+hides it to the tray — the settings only last while the process is alive — and
+Exit in the tray menu really quits.
+
+The window is dark by default. **Dark theme** in the tray menu switches it to
+light and back, and the choice is saved. Popup menus follow along on Windows 10
+1903 and later through an undocumented uxtheme export, guarded by build number;
+the two confirmation prompts are standard message boxes and stay light.
 
 ### Starting it automatically
 
@@ -236,10 +247,12 @@ instruction it does not have.
 | --- | --- |
 | `src/wlan.h`, `src/wlan_core.c` | policy: what to apply, when to retry, how to read an error |
 | `src/wlan_win32.c` | the only file that touches wlanapi |
-| `src/app.c` | window, list, tray, DPI, config, worker thread |
+| `src/app.c` | config, icon, worker thread, startup |
+| `src/app_ui.c` | the main window: switches, adapter cards, tray |
+| `src/ui.h`, `src/ui_draw.c`, `src/ui_ctl.c` | theme, anti-aliased drawing, owner-drawn switches and buttons, scrolling panel |
 | `src/tune.h`, `src/tune.c` | the settings model, and writing only what changed |
 | `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params` |
-| `src/tune_power.c` | the active power scheme, enumerated rather than hardcoded |
-| `src/tune_ui.c` | the tuning dialog |
+| `src/tune_power.c` | the two Wi-Fi-path power settings in the active scheme |
+| `src/tune_ui.c` | the tuning window |
 | `tests/test_core.c` | regression test per fixed defect and per recovery path |
 | `planned/monitoring.md` | design for the latency/signal monitor; not implemented |

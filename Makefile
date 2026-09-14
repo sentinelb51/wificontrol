@@ -38,11 +38,18 @@ WLDFLAGS = -municode -mwindows $(OPT) $(if $(ARCH),-march=$(ARCH)) \
            -Wl,--gc-sections -s \
            -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
 WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32 \
-           -lsetupapi -lpowrprof -ladvapi32 -luuid
+           -lsetupapi -lpowrprof -ladvapi32 -luuid -luxtheme -ldwmapi
 
-WSRC     = src/app.c src/wlan_core.c src/wlan_win32.c \
+WSRC     = src/app.c src/app_ui.c src/ui_draw.c src/ui_ctl.c \
+           src/wlan_core.c src/wlan_win32.c \
            src/tune.c src/tune_driver.c src/tune_power.c src/tune_ui.c
 WOBJ     = $(patsubst src/%.c,$(BUILD)/%.o,$(WSRC)) $(BUILD)/app.res.o
+
+# Some GCC builds (WinLibs, MSYS2) link a default-manifest.o into every exe.
+# ld cannot merge it with ours, so both manifests end up in the binary.  An
+# empty object of the same name, found first through -B, takes its place; on
+# toolchains without one this changes nothing.
+NOMANIFEST = $(BUILD)/nomanifest/default-manifest.o
 
 TESTBIN  = $(BUILD)/test_core
 TESTFLAGS= -std=$(HOSTSTD) $(WARN) -g -fsanitize=address,undefined
@@ -59,8 +66,12 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 $(BUILD)/app.res.o: src/app.rc src/resource.h src/app.manifest | $(BUILD)
 	$(WINDRES) -I src $< -o $@
 
-$(BUILD)/wificontrol.exe: $(WOBJ)
-	$(WINCC) $(WOBJ) -o $@ $(WLDFLAGS) $(WLIBS)
+$(NOMANIFEST):
+	@mkdir -p $(dir $@)
+	printf '' | $(WINCC) -c -x c - -o $@
+
+$(BUILD)/wificontrol.exe: $(WOBJ) $(NOMANIFEST)
+	$(WINCC) $(WOBJ) -o $@ -B$(dir $(NOMANIFEST)) $(WLDFLAGS) $(WLIBS)
 	@echo "built $@ with -std=$(STD) ($$(stat -c %s $@ 2>/dev/null || stat -f %z $@) bytes)"
 
 test: $(TESTBIN)
@@ -72,10 +83,13 @@ $(TESTBIN): tests/test_core.c src/wlan_core.c src/wlan.h | $(BUILD)
 clean:
 	rm -rf $(BUILD)
 
-$(BUILD)/app.o:        src/wlan.h src/wlan_win32.h src/resource.h
+$(BUILD)/app.o:        src/app.h src/ui.h src/wlan.h src/wlan_win32.h
+$(BUILD)/app_ui.o:     src/app.h src/ui.h src/tune.h src/wlan.h src/wlan_win32.h src/resource.h
+$(BUILD)/ui_draw.o:    src/ui.h
+$(BUILD)/ui_ctl.o:     src/ui.h
 $(BUILD)/wlan_core.o:  src/wlan.h
 $(BUILD)/wlan_win32.o: src/wlan.h src/wlan_win32.h
 $(BUILD)/tune.o:        src/tune.h src/wlan.h
 $(BUILD)/tune_driver.o: src/tune.h src/wlan.h src/wlan_win32.h
 $(BUILD)/tune_power.o:  src/tune.h src/wlan.h
-$(BUILD)/tune_ui.o:     src/tune.h src/wlan.h src/wlan_win32.h src/resource.h
+$(BUILD)/tune_ui.o:     src/tune.h src/ui.h src/wlan.h src/wlan_win32.h src/resource.h

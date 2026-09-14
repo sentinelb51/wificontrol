@@ -4,38 +4,18 @@
 /* CREATEPROCESS_MANIFEST_RESOURCE_ID, RT_MANIFEST */
 1 24 "app.manifest"
 
-IDD_MAIN DIALOGEX 0, 0, 330, 196
-STYLE DS_SETFONT | DS_CENTER | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION | WS_SYSMENU
+/* Both windows are laid out in code at the monitor's DPI, so the templates
+ * carry only the frame; every control is created and painted at runtime. */
+IDD_MAIN DIALOGEX 0, 0, 320, 200
+STYLE DS_SETFONT | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
 CAPTION "WiFi Control"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    AUTOCHECKBOX  "&Optimize the checked adapters", IDC_ENABLE, 7, 7, 200, 10
-    AUTOCHECKBOX  "Stop &all scanning (disables Wi-Fi auto config)", IDC_NUKE, 7, 21, 180, 10
-    COMBOBOX      IDC_NUKE_FOR, 191, 19, 132, 120,
-                  CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    CONTROL       "", IDC_LIST, "SysListView32",
-                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
-                  7, 36, 316, 108
-    LTEXT         "", IDC_STATUS, 7, 150, 316, 20
-    PUSHBUTTON    "&Tuning...", IDC_TUNE, 165, 175, 50, 14
-    PUSHBUTTON    "&Refresh", IDC_REFRESH, 219, 175, 50, 14
-    DEFPUSHBUTTON "&Hide", IDOK, 273, 175, 50, 14
 END
 
-IDD_TUNE DIALOGEX 0, 0, 420, 268
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+IDD_TUNE DIALOGEX 0, 0, 380, 300
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
 CAPTION "Tuning"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    LTEXT         "", IDC_TUNE_FOR, 7, 7, 406, 9
-    CONTROL       "", IDC_TUNE_LIST, "SysListView32",
-                  LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
-                  7, 20, 406, 170
-    LTEXT         "&Value:", -1, 7, 199, 30, 9
-    COMBOBOX      IDC_TUNE_VAL, 40, 196, 200, 200,
-                  CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT         "", IDC_TUNE_HINT, 7, 216, 406, 26
-    PUSHBUTTON    "Restart &adapter", IDC_TUNE_RESTART, 227, 247, 72, 14
-    PUSHBUTTON    "&Apply", IDC_TUNE_APPLY, 305, 247, 50, 14
-    DEFPUSHBUTTON "&Close", IDOK, 359, 247, 50, 14
 END

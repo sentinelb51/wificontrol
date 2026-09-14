@@ -1,4 +1,5 @@
-/* app.c -- Win32 front end for WiFi Control.
+/* app.c -- WiFi Control's process: config, the icon, the worker thread and
+ * startup.  The window itself is app_ui.c.
  *
  * Threading: the UI thread owns the window, the tray icon and the config file.
  * A worker thread owns the WLAN client handle and the policy core, because
@@ -6,12 +7,10 @@
  * the UI thread.  They talk only by posted messages, so there are no locks.
  */
 #define WIN32_LEAN_AND_MEAN
-#include "wlan_win32.h"
-#include "tune.h"
-#include "resource.h"
+#include "app.h"
+#include "ui.h"
 
 #include <commctrl.h>
-#include <shellapi.h>
 #include <process.h>
 #include <math.h>
 #include <stdio.h>
@@ -19,55 +18,15 @@
 #include <wchar.h>
 #include <string.h>
 
-#ifndef WM_DPICHANGED
-#define WM_DPICHANGED 0x02E0
-#endif
-#ifndef LVS_EX_DOUBLEBUFFER
-#define LVS_EX_DOUBLEBUFFER 0x00010000
-#endif
-
-/* UI thread messages */
-#define WM_U_SNAPSHOT (WM_APP + 1)
-#define WM_U_TRAY     (WM_APP + 2)
-
-/* worker thread messages */
-#define WM_W_POLL     (WM_APP + 10)
-#define WM_W_ENABLE   (WM_APP + 11)
-#define WM_W_MANAGE   (WM_APP + 12)
-#define WM_W_QUIT     (WM_APP + 13)
-#define WM_W_NUCLEAR  (WM_APP + 14)
-
 #define T_DEBOUNCE 1
 #define T_WATCHDOG 2
-#define T_DEADMAN  3
 
 #define DEBOUNCE_MS  250
 #define MIN_POLL_MS 1000
 #define WATCHDOG_MS 60000
 
-/* ------------------------------------------------------------------ types */
-
-typedef struct {
-    wc_guid       guid;
-    wchar_t       name[WC_NAME_MAX];
-    wc_ifstate    state;
-    bool          present, managed, pending;
-    wc_val        streaming, bgscan, autoconf;
-    unsigned long last_err;
-} snap_row;
-
-typedef struct {
-    int           n;
-    bool          enabled, write_denied, nuclear;
-    int           recovered;
-    unsigned long enum_err, open_err;
-    snap_row      row[WC_MAX_ADAPTERS];
-} snapshot;
-
 typedef struct { wc_guid g; bool managed; } cfg_entry;
-typedef struct { bool enabled; int n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
-
-typedef struct { wc_guid g; bool on; } manage_cmd;
+typedef struct { bool enabled, dark; int n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
 
 /* ----------------------------------------------------------------- config */
 
@@ -120,6 +79,7 @@ static void cfg_load(cfg *c)
 {
     memset(c, 0, sizeof *c);
     c->enabled = GetPrivateProfileIntW(L"general", L"enabled", 1, g_cfg_path) != 0;
+    c->dark    = GetPrivateProfileIntW(L"general", L"dark", 1, g_cfg_path) != 0;
 
     /* Adapters absent from the file default to managed. */
     wchar_t buf[4096];
@@ -140,12 +100,17 @@ static void cfg_load(cfg *c)
     }
 }
 
-static void cfg_save_enabled(bool on)
+void cfg_save_enabled(bool on)
 {
     WritePrivateProfileStringW(L"general", L"enabled", on ? L"1" : L"0", g_cfg_path);
 }
 
-static void cfg_save_managed(const wc_guid *g, bool on)
+void cfg_save_dark(bool on)
+{
+    WritePrivateProfileStringW(L"general", L"dark", on ? L"1" : L"0", g_cfg_path);
+}
+
+void cfg_save_managed(const wc_guid *g, bool on)
 {
     wchar_t key[64];
     guid_to_str(g, key, 64);
@@ -205,7 +170,7 @@ static void raster(unsigned char *px, int size, COLORREF c)
     }
 }
 
-static HICON make_icon(int size, COLORREF c)
+HICON make_icon(int size, COLORREF c)
 {
     BITMAPV5HEADER bi;
     memset(&bi, 0, sizeof bi);
@@ -248,8 +213,9 @@ static HICON make_icon(int size, COLORREF c)
 
 /* ----------------------------------------------------------------- worker */
 
-static HWND      g_ui;
-static HWND      g_worker;
+HWND             g_ui;
+HWND             g_worker;
+UINT             g_msg_show;
 static HANDLE    g_worker_ready;
 static HANDLE    g_worker_thread;
 static wc_win32  g_win32;
@@ -416,570 +382,13 @@ static unsigned __stdcall worker_main([[maybe_unused]] void *param)
     return 0;
 }
 
-/* --------------------------------------------------------------------- UI */
-
-static snapshot *g_snap;
-static HICON     g_icon_small, g_icon_big;
-static COLORREF  g_icon_color = 0;
-static int       g_tray_added;
-static int       g_filling;
-static bool      g_list_stale;
-static bool      g_nuke_confirmed;   /* asked once per session, not persisted */
-static bool      g_expect_repair;    /* we just disarmed: the next repair is ours */
-
-/* Never written to the config file.  The app always starts disarmed, which is
- * what makes the first poll repair a previous run that was killed while armed:
- * there is no stored flag to be wrong about. */
-typedef struct { const wchar_t *label; UINT minutes; } nuke_span;
-static const nuke_span NUKE_FOR[] = {
-    { L"for 15 minutes",      15 },
-    { L"for 5 minutes",        5 },
-    { L"for 30 minutes",      30 },
-    { L"for 1 hour",          60 },
-    { L"until I turn it off",  0 },
-};
-static int       g_warned_tray;
-static UINT      g_msg_show;
-static UINT      g_msg_taskbar;
-static HFONT     g_font;
-static int       g_dpi = 96;
-static int       g_base_dpi = 96;
-static RECT      g_base[16];
-static HWND      g_base_hwnd[16];
-static int       g_base_n;
-
-static COLORREF state_color(const snapshot *s)
-{
-    if (!s || s->open_err || s->enum_err) return RGB(200, 60, 60);
-    if (s->write_denied)                  return RGB(214, 152, 32);
-    if (!s->enabled)                      return RGB(128, 132, 138);
-    if (s->nuclear)                       return RGB(198, 86, 26); /* armed: unmistakable */
-    for (int i = 0; i < s->n; ++i)
-        if (s->row[i].present && s->row[i].last_err) return RGB(214, 152, 32);
-    for (int i = 0; i < s->n; ++i)
-        if (s->row[i].present && s->row[i].managed &&
-            (s->row[i].bgscan == WC_VAL_OFF || s->row[i].streaming == WC_VAL_ON))
-            return RGB(43, 145, 72);
-    return RGB(128, 132, 138);
-}
-
-static void tray_update(HWND hwnd, const wchar_t *tip)
-{
-    static wchar_t last_tip[128];
-    COLORREF c = state_color(g_snap);
-
-    if (g_tray_added && c == g_icon_color && wcsncmp(last_tip, tip, 127) == 0)
-        return; /* nothing the shell would render differently */
-
-    if (!g_tray_added || c != g_icon_color) {
-        HICON fresh = make_icon(GetSystemMetrics(SM_CXSMICON), c);
-        if (fresh) {
-            HICON old = g_icon_small;
-            g_icon_small = fresh;
-            g_icon_color = c;
-            if (old) DestroyIcon(old);
-        }
-    }
-
-    NOTIFYICONDATAW nid;
-    memset(&nid, 0, sizeof nid);
-    nid.cbSize           = sizeof nid;
-    nid.hWnd             = hwnd;
-    nid.uID              = 1;
-    nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    nid.uCallbackMessage = WM_U_TRAY;
-    nid.hIcon            = g_icon_small;
-    wcsncpy(nid.szTip, tip, sizeof nid.szTip / sizeof nid.szTip[0] - 1);
-
-    if (!g_tray_added) g_tray_added = Shell_NotifyIconW(NIM_ADD, &nid) ? 1 : 0;
-    else               Shell_NotifyIconW(NIM_MODIFY, &nid);
-
-    wcsncpy(last_tip, tip, 127);
-    last_tip[127] = L'\0';
-}
-
-static void tray_remove(HWND hwnd)
-{
-    if (!g_tray_added) return;
-    NOTIFYICONDATAW nid;
-    memset(&nid, 0, sizeof nid);
-    nid.cbSize = sizeof nid;
-    nid.hWnd   = hwnd;
-    nid.uID    = 1;
-    Shell_NotifyIconW(NIM_DELETE, &nid);
-    g_tray_added = 0;
-}
-
-static void tray_balloon(HWND hwnd, const wchar_t *title, const wchar_t *text)
-{
-    if (!g_tray_added) return;
-    NOTIFYICONDATAW nid;
-    memset(&nid, 0, sizeof nid);
-    nid.cbSize = sizeof nid;
-    nid.hWnd   = hwnd;
-    nid.uID    = 1;
-    nid.uFlags = NIF_INFO;
-    wcsncpy(nid.szInfoTitle, title, sizeof nid.szInfoTitle / sizeof nid.szInfoTitle[0] - 1);
-    wcsncpy(nid.szInfo, text, sizeof nid.szInfo / sizeof nid.szInfo[0] - 1);
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
-}
-
-static const wchar_t *val_text(wc_val v)
-{
-    return v == WC_VAL_ON ? L"on" : v == WC_VAL_OFF ? L"off" : L"–";
-}
-
-static void row_status(const snap_row *r, bool enabled, wchar_t *out, int cap)
-{
-    if (!r->present)          { wcsncpy(out, L"not present", (size_t)cap - 1); out[cap-1]=0; return; }
-    if (r->last_err)          { wcw_format_error(r->last_err, out, cap); return; }
-    if (!r->managed)          { wcsncpy(out, L"not managed", (size_t)cap - 1); out[cap-1]=0; return; }
-    if (!enabled)             { wcsncpy(out, L"off", (size_t)cap - 1); out[cap-1]=0; return; }
-    if (r->pending)           { wcsncpy(out, L"waiting for a connection", (size_t)cap - 1); out[cap-1]=0; return; }
-    wcsncpy(out, L"optimized", (size_t)cap - 1);
-    out[cap - 1] = L'\0';
-}
-
-static void fill_list(HWND hwnd)
-{
-    HWND lv = GetDlgItem(hwnd, IDC_LIST);
-    g_filling = 1;
-    SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(lv);
-
-    if (g_snap) {
-        for (int i = 0; i < g_snap->n; ++i) {
-            const snap_row *r = &g_snap->row[i];
-            LVITEMW it;
-            memset(&it, 0, sizeof it);
-            it.mask     = LVIF_TEXT | LVIF_PARAM;
-            it.iItem    = i;
-            it.pszText  = (LPWSTR)r->name;
-            it.lParam   = i;
-            int row = ListView_InsertItem(lv, &it);
-            if (row < 0) continue;
-
-            wchar_t buf[256];
-            MultiByteToWideChar(CP_UTF8, 0, wc_state_name(r->state), -1, buf, 256);
-            ListView_SetItemText(lv, row, 1, buf);
-            ListView_SetItemText(lv, row, 2, (LPWSTR)val_text(r->bgscan));
-            ListView_SetItemText(lv, row, 3, (LPWSTR)val_text(r->streaming));
-            ListView_SetItemText(lv, row, 4, (LPWSTR)val_text(r->autoconf));
-            row_status(r, g_snap->enabled, buf, 256);
-            ListView_SetItemText(lv, row, 5, buf);
-            ListView_SetCheckState(lv, row, r->managed ? TRUE : FALSE);
-        }
-    }
-    SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(lv, NULL, TRUE);
-    g_filling = 0;
-}
-
-static void update_status(HWND hwnd)
-{
-    wchar_t text[512], err[256];
-
-    if (!g_snap) {
-        wcscpy(text, L"Starting…");
-    } else if (g_snap->open_err) {
-        wcw_format_error(g_snap->open_err, err, 256);
-        _snwprintf(text, 512, L"Cannot reach the WLAN service: %s\r\n"
-                              L"Check that the WLAN AutoConfig service is running.", err);
-    } else if (g_snap->enum_err) {
-        wcw_format_error(g_snap->enum_err, err, 256);
-        _snwprintf(text, 512, L"Cannot list adapters: %s", err);
-    } else if (g_snap->write_denied) {
-        wcscpy(text, L"Windows is refusing these settings even with administrator rights.\r\n"
-                     L"A group policy or a Native Wifi permission change is blocking them.");
-    } else {
-        int active = 0, waiting = 0;
-        for (int i = 0; i < g_snap->n; ++i) {
-            const snap_row *r = &g_snap->row[i];
-            if (!r->present || !r->managed) continue;
-            if (r->pending) waiting++;
-            else if (r->bgscan == WC_VAL_OFF || r->streaming == WC_VAL_ON) active++;
-        }
-        if (!g_snap->enabled)
-            wcscpy(text, L"Off. Windows defaults are in effect.");
-        else if (g_snap->nuclear)
-            _snwprintf(text, 512, L"Scanning stopped on %d adapter%s. No roaming and no "
-                                  L"automatic reconnect while this is on.",
-                       active, active == 1 ? L"" : L"s");
-        else if (active || waiting)
-            _snwprintf(text, 512, L"Optimizing %d adapter%s%s. Settings are released "
-                                  L"automatically when this app exits.",
-                       active, active == 1 ? L"" : L"s",
-                       waiting ? L", waiting on a connection for others" : L"");
-        else
-            wcscpy(text, L"No connected Wi-Fi adapter to optimize yet.");
-    }
-    /* A repair while armed is the expected reaction to a dropped link, and one
-     * straight after disarming is our own doing.  Anything else means we found
-     * auto config switched off by a run that never got to clean up. */
-    bool foreign_repair = g_snap && g_snap->recovered > 0 && !g_snap->nuclear &&
-                          !g_expect_repair;
-    if (g_snap && g_snap->recovered > 0) g_expect_repair = false;
-
-    wchar_t note[256] = L"";
-    if (foreign_repair) {
-        _snwprintf(note, 256, L"Re-enabled Wi-Fi auto configuration on %d adapter%s "
-                              L"that had been left disabled.",
-                   g_snap->recovered, g_snap->recovered == 1 ? L"" : L"s");
-        note[255] = L'\0';
-        wcsncpy(text, note, 511);
-    }
-    text[511] = L'\0';
-    SetDlgItemTextW(hwnd, IDC_STATUS, text);
-    tray_update(hwnd, text);
-    /* After tray_update, so the icon exists to hang it on at startup. */
-    if (note[0]) tray_balloon(hwnd, L"WiFi Control", note);
-}
-
-static void arm_deadman(HWND hwnd)
-{
-    KillTimer(hwnd, T_DEADMAN);
-    int k = (int)SendMessageW(GetDlgItem(hwnd, IDC_NUKE_FOR), CB_GETCURSEL, 0, 0);
-    if (k < 0 || k >= (int)(sizeof NUKE_FOR / sizeof NUKE_FOR[0])) k = 0;
-    UINT minutes = NUKE_FOR[k].minutes;
-    if (minutes) SetTimer(hwnd, T_DEADMAN, minutes * 60u * 1000u, nullptr);
-}
-
-static void set_nuclear(HWND hwnd, bool on)
-{
-    CheckDlgButton(hwnd, IDC_NUKE, on ? BST_CHECKED : BST_UNCHECKED);
-    EnableWindow(GetDlgItem(hwnd, IDC_NUKE_FOR), !on);
-    if (on) {
-        arm_deadman(hwnd);
-    } else {
-        KillTimer(hwnd, T_DEADMAN);
-        /* The repair this triggers is expected, so do not report it as having
-         * cleaned up after something. */
-        g_expect_repair = true;
-    }
-    PostMessageW(g_worker, WM_W_NUCLEAR, (WPARAM)on, 0);
-}
-
-static bool confirm_nuclear(HWND hwnd)
-{
-    if (g_nuke_confirmed) return true;
-    int r = MessageBoxW(hwnd,
-        L"Disable Wi-Fi auto configuration on the checked adapters?\n\n"
-        L"This stops scanning completely, which is the point \u2014 but it also stops "
-        L"roaming to a better access point, and stops Windows reconnecting on its "
-        L"own if the link drops.\n\n"
-        L"It is put back automatically when the link drops, when you turn this off, "
-        L"when the timer expires, and when this app exits or next starts. If the app "
-        L"is killed outright, it stays off until you run it again.",
-        L"Stop all scanning", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
-    g_nuke_confirmed = (r == IDYES);
-    return g_nuke_confirmed;
-}
-
-static void send_manage(const wc_guid *g, bool on)
-{
-    manage_cmd *c = malloc(sizeof *c);
-    if (!c) return;
-    c->g  = *g;
-    c->on = on;
-    if (!PostMessageW(g_worker, WM_W_MANAGE, 0, (LPARAM)c)) free(c);
-}
-
-/* ------------------------------------------------------------------- DPI */
-
-static int dpi_of(HWND hwnd)
-{
-    typedef UINT (WINAPI *pfn)(HWND);
-    static pfn get;
-    static int probed;
-    if (!probed) {
-        probed = 1;
-        HMODULE u = GetModuleHandleW(L"user32.dll");
-        if (u) get = (pfn)(void *)GetProcAddress(u, "GetDpiForWindow");
-    }
-    if (get) {
-        UINT d = get(hwnd);
-        if (d) return (int)d;
-    }
-    HDC dc = GetDC(NULL);
-    int d = GetDeviceCaps(dc, LOGPIXELSX);
-    ReleaseDC(NULL, dc);
-    return d ? d : 96;
-}
-
-static BOOL CALLBACK cache_child(HWND child, [[maybe_unused]] LPARAM lp)
-{
-    if (g_base_n >= 16) return FALSE;
-    RECT r;
-    GetWindowRect(child, &r);
-    MapWindowPoints(NULL, GetParent(child), (POINT *)&r, 2);
-    g_base_hwnd[g_base_n] = child;
-    g_base[g_base_n] = r;
-    g_base_n++;
-    return TRUE;
-}
-
-static void apply_font(HWND hwnd, int dpi)
-{
-    HFONT old = g_font;
-    g_font = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    if (!g_font) { g_font = old; return; }
-    SendMessageW(hwnd, WM_SETFONT, (WPARAM)g_font, TRUE);
-    for (int i = 0; i < g_base_n; ++i)
-        SendMessageW(g_base_hwnd[i], WM_SETFONT, (WPARAM)g_font, TRUE);
-    if (old) DeleteObject(old);
-}
-
-/* Column widths are authored for 96 dpi; everything else is already sized by
- * the dialog manager at whatever DPI the dialog was created on. */
-static void layout_columns(HWND hwnd, int dpi)
-{
-    HWND lv = GetDlgItem(hwnd, IDC_LIST);
-    static constexpr int w[6] = { 150, 74, 52, 52, 52, 150 };
-    for (int i = 0; i < 6; ++i) ListView_SetColumnWidth(lv, i, MulDiv(w[i], dpi, 96));
-}
-
-/* Children were cached at g_base_dpi, not at 96: a dialog template is laid out
- * in dialog units against the font of the monitor it was created on, so the
- * ratio to apply is new/cached, not new/96. */
-static void rescale(HWND hwnd, int dpi, const RECT *suggest)
-{
-    if (suggest)
-        SetWindowPos(hwnd, NULL, suggest->left, suggest->top,
-                     suggest->right - suggest->left, suggest->bottom - suggest->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-
-    for (int i = 0; i < g_base_n; ++i) {
-        RECT r = g_base[i];
-        SetWindowPos(g_base_hwnd[i], NULL,
-                     MulDiv(r.left, dpi, g_base_dpi), MulDiv(r.top, dpi, g_base_dpi),
-                     MulDiv(r.right - r.left, dpi, g_base_dpi),
-                     MulDiv(r.bottom - r.top, dpi, g_base_dpi),
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    apply_font(hwnd, dpi);
-    layout_columns(hwnd, dpi);
-    g_dpi = dpi;
-}
-
-/* --------------------------------------------------------------- dlg proc */
-
-static void show_main(HWND hwnd)
-{
-    if (g_list_stale) { fill_list(hwnd); g_list_stale = false; }
-    ShowWindow(hwnd, SW_SHOW);
-    SetForegroundWindow(hwnd);
-}
-
-static void tray_menu(HWND hwnd)
-{
-    HMENU m = CreatePopupMenu();
-    if (!m) return;
-    AppendMenuW(m, MF_STRING, IDM_SHOW, L"&Show WiFi Control");
-    AppendMenuW(m, MF_STRING | ((g_snap && g_snap->enabled) ? MF_CHECKED : 0),
-                IDM_TOGGLE, L"&Optimize");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, IDM_EXIT, L"E&xit");
-    SetMenuDefaultItem(m, IDM_SHOW, FALSE);
-
-    POINT p;
-    GetCursorPos(&p);
-    SetForegroundWindow(hwnd); /* so the menu dismisses on click-away */
-    TrackPopupMenu(m, TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, NULL);
-    PostMessageW(hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
-}
-
-static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    if (msg == g_msg_taskbar && g_msg_taskbar) { g_tray_added = 0; update_status(hwnd); return TRUE; }
-    if (msg == g_msg_show && g_msg_show)       { show_main(hwnd); return TRUE; }
-
-    switch (msg) {
-    case WM_INITDIALOG: {
-        g_ui = hwnd;
-        EnumChildWindows(hwnd, cache_child, 0);
-
-        HWND lv = GetDlgItem(hwnd, IDC_LIST);
-        ListView_SetExtendedListViewStyle(lv, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT |
-                                              LVS_EX_DOUBLEBUFFER);
-        static const wchar_t *cols[6] = { L"Adapter", L"State", L"Bkg scan",
-                                          L"Streaming", L"Auto cfg", L"Status" };
-        for (int i = 0; i < 6; ++i) {
-            LVCOLUMNW c;
-            memset(&c, 0, sizeof c);
-            c.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-            c.iSubItem = i;
-            c.pszText  = (LPWSTR)cols[i];
-            c.cx       = 100;
-            ListView_InsertColumn(lv, i, &c);
-        }
-
-        HWND nf = GetDlgItem(hwnd, IDC_NUKE_FOR);
-        for (size_t k = 0; k < sizeof NUKE_FOR / sizeof NUKE_FOR[0]; ++k)
-            SendMessageW(nf, CB_ADDSTRING, 0, (LPARAM)NUKE_FOR[k].label);
-        SendMessageW(nf, CB_SETCURSEL, 0, 0);
-
-        g_icon_big = make_icon(GetSystemMetrics(SM_CXICON), RGB(43, 145, 72));
-        if (g_icon_big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_icon_big);
-
-        g_dpi = g_base_dpi = dpi_of(hwnd);
-        layout_columns(hwnd, g_dpi);
-        update_status(hwnd);
-        return TRUE;
-    }
-
-    case WM_U_SNAPSHOT: {
-        snapshot *fresh = (snapshot *)lp;
-        free(g_snap);
-        g_snap = fresh;
-        CheckDlgButton(hwnd, IDC_ENABLE, g_snap && g_snap->enabled ? BST_CHECKED : BST_UNCHECKED);
-        /* Rebuilding the list costs a teardown plus five text sets per row.
-         * While we are in the tray nobody can see it, so defer to the reveal. */
-        if (IsWindowVisible(hwnd)) { fill_list(hwnd); g_list_stale = false; }
-        else                         g_list_stale = true;
-        update_status(hwnd);
-        return TRUE;
-    }
-
-    case WM_NOTIFY: {
-        NMHDR *nh = (NMHDR *)lp;
-        if (nh->idFrom == IDC_LIST && nh->code == LVN_ITEMCHANGED && !g_filling) {
-            NMLISTVIEW *nv = (NMLISTVIEW *)lp;
-            if (nv->uChanged & LVIF_STATE) {
-                int was = (int)((nv->uOldState & LVIS_STATEIMAGEMASK) >> 12);
-                int now = (int)((nv->uNewState & LVIS_STATEIMAGEMASK) >> 12);
-                if (was && now && was != now && g_snap &&
-                    nv->lParam >= 0 && nv->lParam < g_snap->n) {
-                    bool on = (now == 2);
-                    const wc_guid *g = &g_snap->row[nv->lParam].guid;
-                    g_snap->row[nv->lParam].managed = on;
-                    cfg_save_managed(g, on);
-                    send_manage(g, on);
-                }
-            }
-        }
-        return FALSE;
-    }
-
-    case WM_U_TRAY:
-        if (lp == WM_LBUTTONDBLCLK || lp == WM_LBUTTONUP) show_main(hwnd);
-        else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) tray_menu(hwnd);
-        return TRUE;
-
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_ENABLE: {
-            bool on = IsDlgButtonChecked(hwnd, IDC_ENABLE) == BST_CHECKED;
-            cfg_save_enabled(on);
-            if (!on) set_nuclear(hwnd, false); /* the core ignores it anyway; say so */
-            PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
-            return TRUE;
-        }
-        case IDM_TOGGLE: {
-            bool on = !(g_snap && g_snap->enabled);
-            CheckDlgButton(hwnd, IDC_ENABLE, on ? BST_CHECKED : BST_UNCHECKED);
-            cfg_save_enabled(on);
-            PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
-            return TRUE;
-        }
-        case IDC_NUKE: {
-            bool on = IsDlgButtonChecked(hwnd, IDC_NUKE) == BST_CHECKED;
-            if (on && !confirm_nuclear(hwnd)) { set_nuclear(hwnd, false); return TRUE; }
-            set_nuclear(hwnd, on);
-            return TRUE;
-        }
-        case IDC_REFRESH:
-            PostMessageW(g_worker, WM_W_POLL, 0, 0);
-            return TRUE;
-        case IDC_TUNE: {
-            if (!g_snap || g_snap->n == 0) {
-                MessageBoxW(hwnd, L"No Wi-Fi adapter to tune.", L"Tuning", MB_ICONINFORMATION);
-                return TRUE;
-            }
-            HWND lv = GetDlgItem(hwnd, IDC_LIST);
-            int row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
-            int i = -1;
-            if (row >= 0) {
-                LVITEMW it = { .mask = LVIF_PARAM, .iItem = row };
-                if (ListView_GetItem(lv, &it) && it.lParam >= 0 && it.lParam < g_snap->n)
-                    i = (int)it.lParam;
-            }
-            if (i < 0)
-                for (int k = 0; k < g_snap->n; ++k)
-                    if (g_snap->row[k].present) { i = k; break; }
-            if (i < 0) i = 0;
-            tune_dialog(hwnd, &g_snap->row[i].guid, g_snap->row[i].name);
-            return TRUE;
-        }
-        case IDM_SHOW:
-            show_main(hwnd);
-            return TRUE;
-        case IDOK:
-        case IDCANCEL:
-            ShowWindow(hwnd, SW_HIDE);
-            if (!g_warned_tray) {
-                g_warned_tray = 1;
-                tray_balloon(hwnd, L"WiFi Control",
-                             L"Still running here. The settings only last while it runs.");
-            }
-            return TRUE;
-        case IDM_EXIT:
-            DestroyWindow(hwnd);
-            return TRUE;
-        }
-        return FALSE;
-
-    case WM_TIMER:
-        if (wp == T_DEADMAN) {
-            KillTimer(hwnd, T_DEADMAN);
-            set_nuclear(hwnd, false);
-            tray_balloon(hwnd, L"WiFi Control",
-                         L"Timer expired \u2014 scanning and auto configuration are back on.");
-        }
-        return TRUE;
-
-    case WM_QUERYENDSESSION:
-        return TRUE;
-
-    case WM_ENDSESSION:
-        /* Logging off or shutting down: WM_DESTROY is not guaranteed to run,
-         * and auto config would survive the reboot still disabled.  Send, not
-         * post, so the worker has actually written it before we return. */
-        if (wp && g_worker) SendMessageW(g_worker, WM_W_NUCLEAR, 0, 0);
-        return TRUE;
-
-    case WM_SYSCOMMAND:
-        if ((wp & 0xFFF0) == SC_MINIMIZE) { ShowWindow(hwnd, SW_HIDE); return TRUE; }
-        return FALSE;
-
-    case WM_POWERBROADCAST:
-        /* Notifications can be missed across a suspend; re-apply on resume. */
-        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND)
-            PostMessageW(g_worker, WM_W_POLL, 0, 0);
-        return TRUE;
-
-    case WM_DPICHANGED:
-        rescale(hwnd, (int)HIWORD(wp), (const RECT *)lp);
-        return TRUE;
-
-    case WM_DESTROY:
-        tray_remove(hwnd);
-        PostQuitMessage(0);
-        return TRUE;
-    }
-    return FALSE;
-}
-
 /* ------------------------------------------------------------------- main */
 
 int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
                     LPWSTR cmdline, [[maybe_unused]] int show)
 {
 
-    g_msg_show    = RegisterWindowMessageW(L"WifiControl.Show");
-    g_msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
+    g_msg_show = RegisterWindowMessageW(L"WifiControl.Show");
 
     HANDLE once = CreateMutexW(NULL, FALSE, L"Local\\WifiControl.SingleInstance");
     if (once && GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -988,13 +397,14 @@ int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
         return 0;
     }
 
-    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
     cfg_resolve_path();
     cfg_load(&g_boot_cfg);
+    ui_set_theme(g_boot_cfg.dark);
 
-    HWND dlg = CreateDialogParamW(inst, MAKEINTRESOURCEW(IDD_MAIN), NULL, dlg_proc, 0);
+    HWND dlg = main_window_create(inst);
     if (!dlg) { if (once) CloseHandle(once); return 1; }
 
     g_worker_ready  = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -1002,8 +412,7 @@ int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
     if (g_worker_ready) WaitForSingleObject(g_worker_ready, 10000);
 
     /* Start hidden when asked for on the command line, otherwise show. */
-    if (!wcsstr(cmdline ? cmdline : L"", L"/tray")) ShowWindow(dlg, SW_SHOW);
-    else tray_update(dlg, L"WiFi Control");
+    main_window_start(dlg, wcsstr(cmdline ? cmdline : L"", L"/tray") != nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -1019,10 +428,7 @@ int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
         CloseHandle(g_worker_thread);
     }
     if (g_worker_ready) CloseHandle(g_worker_ready);
-    free(g_snap);
-    if (g_icon_small) DestroyIcon(g_icon_small);
-    if (g_icon_big)   DestroyIcon(g_icon_big);
-    if (g_font)       DeleteObject(g_font);
-    if (once)         CloseHandle(once);
+    main_window_cleanup();
+    if (once) CloseHandle(once);
     return 0;
 }

@@ -1,222 +1,464 @@
-/* tune_ui.c -- the tuning dialog.
+/* tune_ui.c -- the tuning window.
  *
- * One row per setting the system says has a fixed set of choices, one dropdown
- * showing exactly those choices, and an Apply button.  The app never proposes
- * a value and never remembers a previous one; to undo something you pick the
- * other entry in the same dropdown.
+ * One row per setting the system says has a fixed set of choices, each with
+ * its own dropdown of exactly those choices, and an Apply button.  The app
+ * never proposes a value and never remembers a previous one; to undo something
+ * you pick the other entry in the same dropdown.
  */
 #define WIN32_LEAN_AND_MEAN
 #include "tune.h"
+#include "ui.h"
 #include "wlan_win32.h"
 #include "resource.h"
 
 #include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
+/* Layout, in pixels at 96 dpi. */
+enum {
+    CLIENT_W = 600, PAD = 16, TITLE_H = 48, FOOT_H = 86, VIEW_MAX = 460,
+    SECTION_H = 36, ROW_H = 44, HINT_H = 40, COMBO_W = 240,
+    POWER_ROW_H = 84, POWER_COMBOS_Y = 48, POWER_LABEL_W = 74, POWER_COMBO_W = 170,
+    BUTTON_W = 88, BUTTON_H = 30, RESTART_W = 124,
+};
+#define P(v) ui_px((v), t->f.dpi)
+
+/* A row is one setting; a power row pairs its plugged-in and on-battery
+ * entries.  Either index is -1 when that half is absent. */
+typedef struct { int ac, dc; } trow;
 
 typedef struct {
-    wc_guid  adapter;
-    wchar_t  adapter_name[WC_NAME_MAX];
+    wc_guid    adapter;
+    wchar_t    adapter_name[WC_NAME_MAX];
     tune_list *list;
+    ui_fonts   f;
+    HWND       dlg, panel;
+    trow       driver[TUNE_MAX_SETTINGS], power[TUNE_MAX_SETTINGS];
+    int        n_driver, n_power;
+    int        driver_top, driver_hint, power_top, power_hint, content;
+    wchar_t    status[256];
+    bool       status_err;
 } tune_ctx;
 
-static void set_row_value(HWND lv, int row, const tune_setting *s)
+static void collect(tune_ctx *t)
 {
-    wchar_t text[TUNE_TEXT_MAX + 16];
-    const wchar_t *label = (s->sel >= 0) ? s->opt[s->sel].label : L"(not one of the choices)";
-    /* A pending change is marked, not stored: it lives in the dropdown only. */
-    _snwprintf(text, TUNE_TEXT_MAX + 16, L"%s%s",
-               (s->sel != s->cur) ? L"→ " : L"", label);
-    text[TUNE_TEXT_MAX + 15] = L'\0';
-    ListView_SetItemText(lv, row, 2, text);
+    memset(t->list, 0, sizeof *t->list);
+    tune_collect_driver(t->list, &t->adapter);
+    tune_collect_power(t->list);
 }
 
-static void fill_rows(HWND dlg, tune_ctx *c)
+static bool any_pending(const tune_list *l)
 {
-    HWND lv = GetDlgItem(dlg, IDC_TUNE_LIST);
-    int keep = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+    for (int i = 0; i < l->n; ++i)
+        if (l->s[i].sel >= 0 && l->s[i].sel != l->s[i].cur) return true;
+    return false;
+}
 
-    SendMessageW(lv, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(lv);
-
-    for (int i = 0; i < c->list->n; ++i) {
-        tune_setting *s = &c->list->s[i];
-        LVITEMW it = { .mask = LVIF_TEXT | LVIF_PARAM, .iItem = i,
-                       .pszText = s->group, .lParam = i };
-        int row = ListView_InsertItem(lv, &it);
-        if (row < 0) continue;
-        ListView_SetItemText(lv, row, 1, s->name);
-        set_row_value(lv, row, s);
+static bool row_pending(const tune_list *l, trow r)
+{
+    for (int k = 0; k < 2; ++k) {
+        int i = k ? r.dc : r.ac;
+        if (i >= 0 && l->s[i].sel >= 0 && l->s[i].sel != l->s[i].cur) return true;
     }
-    if (keep >= 0 && keep < c->list->n)
-        ListView_SetItemState(lv, keep, LVIS_SELECTED | LVIS_FOCUSED,
-                              LVIS_SELECTED | LVIS_FOCUSED);
-    SendMessageW(lv, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(lv, nullptr, TRUE);
+    return false;
 }
 
-static void collect(tune_ctx *c)
+/* ------------------------------------------------------------------ paint */
+
+static void paint_card_frame(tune_ctx *t, ui_canvas *cv, int y0, int y1)
 {
-    memset(c->list, 0, sizeof *c->list);
-    tune_collect_driver(c->list, &c->adapter);
-    tune_collect_power(c->list);
+    const double s = t->f.dpi / 96.0;
+    ui_frame(cv, P(PAD), y0, cv->w - P(PAD), y1, 6 * s, 1 * s, ui_pal.border, ui_pal.card);
 }
 
-static int selected_index(HWND dlg)
+static void paint_rule(tune_ctx *t, ui_canvas *cv, int y)
 {
-    HWND lv = GetDlgItem(dlg, IDC_TUNE_LIST);
-    int row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
-    if (row < 0) return -1;
-    LVITEMW it = { .mask = LVIF_PARAM, .iItem = row };
-    if (!ListView_GetItem(lv, &it)) return -1;
-    return (int)it.lParam;
+    int h = P(1) > 0 ? P(1) : 1;
+    ui_fill(cv, P(PAD) + P(14), y, cv->w - P(PAD) - P(14), y + h, ui_pal.border);
 }
 
-static void load_combo(HWND dlg, tune_ctx *c)
+static void paint_marker(tune_ctx *t, ui_canvas *cv, int y0, int y1)
 {
-    HWND cb = GetDlgItem(dlg, IDC_TUNE_VAL);
-    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
-
-    int i = selected_index(dlg);
-    if (i < 0 || i >= c->list->n) { EnableWindow(cb, FALSE); return; }
-
-    const tune_setting *s = &c->list->s[i];
-    for (int k = 0; k < s->n_opt; ++k)
-        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)s->opt[k].label);
-    SendMessageW(cb, CB_SETCURSEL, (WPARAM)(s->sel >= 0 ? s->sel : -1), 0);
-    EnableWindow(cb, TRUE);
-
-    SetDlgItemTextW(dlg, IDC_TUNE_HINT,
-        s->src == TUNE_DRIVER
-            ? L"Adapter properties are read by the driver when it starts, so a change "
-              L"applies after the adapter restarts or the machine reboots."
-            : L"Power scheme changes apply as soon as they are written.");
+    const double s = t->f.dpi / 96.0;
+    ui_rrect(cv, P(PAD) + 4 * s, y0 + P(12), P(PAD) + 7 * s, y1 - P(12), 1.5 * s, ui_pal.accent);
 }
 
-static void do_apply(HWND dlg, tune_ctx *c)
+static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll, void *ctx)
+{
+    tune_ctx *t = ctx;
+    const tune_list *l = t->list;
+    const int in = P(PAD) + P(14), right = cv->w - P(PAD) - P(14);
+    const UINT one = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+
+    /* Adapter properties */
+    int y = t->driver_top - scroll;
+    ui_text(cv, t->f.bold, ui_pal.text, L"Adapter properties",
+            P(PAD) + P(2), y - P(SECTION_H), right, y - P(8), DT_SINGLELINE | DT_BOTTOM);
+    paint_card_frame(t, cv, y, t->driver_hint - scroll);
+    if (t->n_driver == 0) {
+        ui_text(cv, t->f.body, ui_pal.text2,
+                l->have_instance ? L"The driver declares no settings with a fixed list of choices."
+                                 : L"Could not locate this adapter's driver key.",
+                in, y, right, y + P(ROW_H), one);
+    }
+    for (int k = 0; k < t->n_driver; ++k) {
+        const int ry = y + k * P(ROW_H);
+        const tune_setting *s = &l->s[t->driver[k].ac];
+        if (k) paint_rule(t, cv, ry);
+        if (row_pending(l, t->driver[k])) paint_marker(t, cv, ry, ry + P(ROW_H));
+        ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry, right - P(COMBO_W) - P(12),
+                ry + P(ROW_H), one);
+    }
+    y = t->driver_hint - scroll;
+    ui_text(cv, t->f.small, ui_pal.text2,
+            L"Read by the driver when it starts: restart the adapter to use a change.",
+            P(PAD) + P(2), y, cv->w - P(PAD) - P(RESTART_W) - P(12), y + P(HINT_H), one);
+
+    /* Power */
+    y = t->power_top - scroll;
+    ui_text(cv, t->f.bold, ui_pal.text, L"Power",
+            P(PAD) + P(2), y - P(SECTION_H), right, y - P(8), DT_SINGLELINE | DT_BOTTOM);
+    paint_card_frame(t, cv, y, t->power_hint - scroll);
+
+    if (t->n_power == 0)
+        ui_text(cv, t->f.body, ui_pal.text2, L"Neither setting exists on this machine.",
+                in, y, right, y + P(ROW_H), one);
+    for (int k = 0; k < t->n_power; ++k) {
+        const int ry = y + k * P(POWER_ROW_H);
+        const tune_setting *s = &l->s[t->power[k].ac >= 0 ? t->power[k].ac : t->power[k].dc];
+        if (k) paint_rule(t, cv, ry);
+        if (row_pending(l, t->power[k])) paint_marker(t, cv, ry, ry + P(POWER_ROW_H));
+        ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry + P(10), right, ry + P(30), one);
+        ui_text(cv, t->f.small, ui_pal.text2, s->group, in, ry + P(28), right, ry + P(46), one);
+
+        /* Two dropdowns, because Windows keeps the two values separately. */
+        const int cy = ry + P(POWER_COMBOS_Y);
+        const int battery_x = in + P(POWER_LABEL_W + POWER_COMBO_W + 20);
+        ui_text(cv, t->f.small, ui_pal.text2, L"Plugged in", in, cy,
+                in + P(POWER_LABEL_W), cy + P(28), one);
+        ui_text(cv, t->f.small, ui_pal.text2, L"On battery", battery_x, cy,
+                battery_x + P(POWER_LABEL_W), cy + P(28), one);
+    }
+    y = t->power_hint - scroll;
+    ui_text(cv, t->f.small, ui_pal.text2,
+            L"Written to the active power plan, and in effect as soon as you press Apply.",
+            P(PAD) + P(2), y, cv->w - P(PAD), y + P(HINT_H), one);
+}
+
+static void paint_frame(tune_ctx *t)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(t->dlg, &ps);
+    RECT rc;
+    GetClientRect(t->dlg, &rc);
+    ui_canvas cv;
+    if (ui_canvas_begin(&cv, dc, rc.right, rc.bottom)) {
+        const int line = P(1) > 0 ? P(1) : 1;
+        ui_fill(&cv, 0, 0, cv.w, cv.h, ui_pal.bg);
+        ui_text(&cv, t->f.title, ui_pal.text, t->adapter_name[0] ? t->adapter_name : L"Tuning",
+                P(PAD), 0, cv.w - P(PAD), P(TITLE_H), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        ui_fill(&cv, 0, P(TITLE_H) - line, cv.w, P(TITLE_H), ui_pal.border);
+
+        const int foot = cv.h - P(FOOT_H);
+        ui_fill(&cv, 0, foot, cv.w, foot + line, ui_pal.border);
+        ui_text(&cv, t->f.body, t->status_err ? ui_pal.err : ui_pal.text2, t->status,
+                P(PAD), foot + P(8), cv.w - P(PAD), foot + P(34),
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        ui_canvas_end(&cv, dc, 0, 0);
+    }
+    EndPaint(t->dlg, &ps);
+}
+
+/* ----------------------------------------------------------------- layout */
+
+static void build(tune_ctx *t)
+{
+    for (int i = 0; i < TUNE_MAX_SETTINGS; ++i) {
+        HWND old = GetDlgItem(t->panel, IDC_TUNE_VALUE + i);
+        if (old) DestroyWindow(old);
+    }
+
+    const tune_list *l = t->list;
+    t->n_driver = t->n_power = 0;
+    for (int i = 0; i < l->n; ++i) {
+        const tune_setting *s = &l->s[i];
+        if (s->src == TUNE_DRIVER) {
+            t->driver[t->n_driver++] = (trow){ i, -1 };
+            continue;
+        }
+        /* tune_collect_power adds plugged in, then on battery. */
+        trow *last = t->n_power ? &t->power[t->n_power - 1] : nullptr;
+        if (s->on_battery && last && last->ac >= 0 && last->dc < 0 &&
+            memcmp(&l->s[last->ac].setting, &s->setting, sizeof(GUID)) == 0)
+            last->dc = i;
+        else
+            t->power[t->n_power++] = s->on_battery ? (trow){ -1, i } : (trow){ i, -1 };
+    }
+
+    for (int i = 0; i < l->n; ++i) {
+        const tune_setting *s = &l->s[i];
+        HWND cb = ui_combo(t->panel, IDC_TUNE_VALUE + i, t->f.body, P(22));
+        if (!cb) continue;
+        for (int k = 0; k < s->n_opt; ++k)
+            SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)s->opt[k].label);
+        SendMessageW(cb, CB_SETCURSEL, (WPARAM)s->sel, 0);
+        if (s->sel < 0) SendMessageW(cb, CB_SETCUEBANNER, 0, (LPARAM)L"Not one of the choices");
+        SetWindowTextW(cb, s->name); /* the name a screen reader reads */
+    }
+
+    /* Recreated dropdowns land after Restart in the tab order; put it back
+     * straight after the adapter's own dropdowns, where it sits on screen. */
+    HWND restart = GetDlgItem(t->panel, IDC_TUNE_RESTART);
+    HWND after = t->n_driver ? GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver[t->n_driver - 1].ac)
+                             : nullptr;
+    if (restart)
+        SetWindowPos(restart, after ? after : HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static void place(HWND w, int x, int y, int cw, int ch)
+{
+    if (w) SetWindowPos(w, nullptr, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void layout(tune_ctx *t, const RECT *at)
+{
+    t->driver_top  = P(SECTION_H);
+    t->driver_hint = t->driver_top + (t->n_driver ? t->n_driver : 1) * P(ROW_H);
+    t->power_top   = t->driver_hint + P(HINT_H) + P(SECTION_H);
+    t->power_hint  = t->power_top + (t->n_power ? t->n_power * P(POWER_ROW_H) : P(ROW_H));
+    t->content     = t->power_hint + P(HINT_H);
+
+    const int view = t->content < P(VIEW_MAX) ? t->content : P(VIEW_MAX);
+    const int cw = P(CLIENT_W), ch = P(TITLE_H) + view + P(FOOT_H);
+    ui_size_window(t->dlg, cw, ch, t->f.dpi, at);
+
+    place(t->panel, 0, P(TITLE_H), cw, view);
+    ui_panel_set_content(t->panel, t->content);
+
+    RECT pr;
+    GetClientRect(t->panel, &pr);
+    const int scroll = ui_panel_scroll(t->panel);
+    const int right = pr.right - P(PAD) - P(12);
+    const tune_list *l = t->list;
+
+    /* A dropdown list's window height is its closed height, whatever is asked. */
+    int combo_h = P(28);
+    HWND first = l->n ? GetDlgItem(t->panel, IDC_TUNE_VALUE) : nullptr;
+    if (first) {
+        place(first, 0, 0, P(COMBO_W), P(300));
+        RECT r;
+        GetWindowRect(first, &r);
+        combo_h = r.bottom - r.top;
+    }
+
+    for (int k = 0; k < t->n_driver; ++k) {
+        const int ry = t->driver_top + k * P(ROW_H) - scroll;
+        place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver[k].ac), right - P(COMBO_W),
+              ry + (P(ROW_H) - combo_h) / 2, P(COMBO_W), P(300));
+    }
+    const int in   = P(PAD) + P(14);
+    const int ac_x = in + P(POWER_LABEL_W);
+    const int dc_x = in + P(POWER_LABEL_W + POWER_COMBO_W + 20 + POWER_LABEL_W);
+    for (int k = 0; k < t->n_power; ++k) {
+        const int ry = t->power_top + k * P(POWER_ROW_H) - scroll;
+        const int cy = ry + P(POWER_COMBOS_Y) + (P(28) - combo_h) / 2;
+        if (t->power[k].ac >= 0)
+            place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->power[k].ac), ac_x, cy,
+                  P(POWER_COMBO_W), P(300));
+        if (t->power[k].dc >= 0)
+            place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->power[k].dc), dc_x, cy,
+                  P(POWER_COMBO_W), P(300));
+    }
+
+    place(GetDlgItem(t->panel, IDC_TUNE_RESTART), pr.right - P(PAD) - P(RESTART_W),
+          t->driver_hint + (P(HINT_H) - P(BUTTON_H - 2)) / 2 - scroll,
+          P(RESTART_W), P(BUTTON_H - 2));
+
+    const int by = ch - P(PAD) - P(BUTTON_H);
+    place(GetDlgItem(t->dlg, IDOK), cw - P(PAD) - P(BUTTON_W), by, P(BUTTON_W), P(BUTTON_H));
+    place(GetDlgItem(t->dlg, IDC_TUNE_APPLY), cw - P(PAD) - 2 * P(BUTTON_W) - P(8), by,
+          P(BUTTON_W), P(BUTTON_H));
+    InvalidateRect(t->dlg, nullptr, FALSE);
+}
+
+static void apply_fonts(tune_ctx *t)
+{
+    HWND ctl[] = { GetDlgItem(t->dlg, IDOK), GetDlgItem(t->dlg, IDC_TUNE_APPLY),
+                   GetDlgItem(t->panel, IDC_TUNE_RESTART) };
+    for (size_t i = 0; i < sizeof ctl / sizeof ctl[0]; ++i)
+        if (ctl[i]) SendMessageW(ctl[i], WM_SETFONT, (WPARAM)t->f.body, FALSE);
+    for (int i = 0; i < t->list->n; ++i) {
+        HWND cb = GetDlgItem(t->panel, IDC_TUNE_VALUE + i);
+        if (!cb) continue;
+        SendMessageW(cb, WM_SETFONT, (WPARAM)t->f.body, FALSE);
+        SendMessageW(cb, CB_SETITEMHEIGHT, (WPARAM)-1, P(22));
+        SendMessageW(cb, CB_SETITEMHEIGHT, 0, P(22));
+    }
+}
+
+static void refresh_state(tune_ctx *t)
+{
+    EnableWindow(GetDlgItem(t->dlg, IDC_TUNE_APPLY), any_pending(t->list));
+    InvalidateRect(t->panel, nullptr, FALSE);
+    InvalidateRect(t->dlg, nullptr, FALSE);
+}
+
+/* Re-read so every row shows what the system actually holds now. */
+static void reload(tune_ctx *t)
+{
+    collect(t);
+    build(t);
+    layout(t, nullptr);
+    ShowWindow(GetDlgItem(t->panel, IDC_TUNE_RESTART), t->list->have_instance ? SW_SHOW : SW_HIDE);
+    refresh_state(t);
+    SendMessageW(t->dlg, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(t->dlg, IDOK), TRUE);
+}
+
+/* ---------------------------------------------------------------- actions */
+
+static void do_apply(tune_ctx *t)
 {
     unsigned long err = 0;
-    int n = tune_apply(c->list, &err);
+    int n = tune_apply(t->list, &err);
 
-    wchar_t msg[512], detail[256];
     if (err) {
-        wcw_format_error(err, detail, 256);
-        _snwprintf(msg, 512, L"Wrote %d setting%s. At least one failed: %s",
+        wchar_t detail[200];
+        wcw_format_error(err, detail, 200);
+        _snwprintf(t->status, 256, L"Wrote %d setting%s. At least one failed: %s",
                    n, n == 1 ? L"" : L"s", detail);
     } else if (n == 0) {
-        wcscpy(msg, L"Nothing to write — no dropdown was changed.");
+        wcscpy(t->status, L"Nothing to write: no dropdown was changed.");
     } else {
-        _snwprintf(msg, 512, L"Wrote %d setting%s.", n, n == 1 ? L"" : L"s");
+        _snwprintf(t->status, 256, L"Wrote %d setting%s.", n, n == 1 ? L"" : L"s");
     }
-    msg[511] = L'\0';
-
-    /* Re-read so the list shows what the system actually holds now. */
-    collect(c);
-    fill_rows(dlg, c);
-    load_combo(dlg, c);
-    MessageBoxW(dlg, msg, L"Tuning", err ? MB_ICONWARNING : MB_ICONINFORMATION);
+    t->status[255] = L'\0';
+    t->status_err  = err != 0;
+    reload(t);
 }
 
-static void do_restart(HWND dlg, tune_ctx *c)
+static void do_restart(tune_ctx *t)
 {
-    if (MessageBoxW(dlg,
+    if (MessageBoxW(t->dlg,
             L"Restart the Wi-Fi adapter now?\n\n"
             L"This disables and re-enables the device so the driver re-reads its "
             L"properties. The connection drops for a few seconds.",
             L"Restart adapter", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES)
         return;
 
+    HWND restart = GetDlgItem(t->panel, IDC_TUNE_RESTART), apply = GetDlgItem(t->dlg, IDC_TUNE_APPLY);
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    EnableWindow(GetDlgItem(dlg, IDC_TUNE_RESTART), FALSE);
-    EnableWindow(GetDlgItem(dlg, IDC_TUNE_APPLY), FALSE);
+    EnableWindow(restart, FALSE);
+    EnableWindow(apply, FALSE);
 
-    unsigned long e = tune_restart_adapter(c->list);
+    unsigned long e = tune_restart_adapter(t->list);
 
-    EnableWindow(GetDlgItem(dlg, IDC_TUNE_RESTART), TRUE);
-    EnableWindow(GetDlgItem(dlg, IDC_TUNE_APPLY), TRUE);
+    EnableWindow(restart, TRUE);
     SetCursor(old);
 
     if (e != ERROR_SUCCESS) {
-        wchar_t detail[256], msg[512];
-        wcw_format_error(e, detail, 256);
-        _snwprintf(msg, 512, L"Could not restart the adapter: %s\n\n"
-                             L"If it is now disabled, re-enable it in Device Manager.",
-                   detail);
-        msg[511] = L'\0';
-        MessageBoxW(dlg, msg, L"Restart adapter", MB_ICONWARNING);
+        wchar_t detail[200], msg[400];
+        wcw_format_error(e, detail, 200);
+        _snwprintf(msg, 400, L"Could not restart the adapter: %s\n\n"
+                             L"If it is now disabled, re-enable it in Device Manager.", detail);
+        msg[399] = L'\0';
+        MessageBoxW(t->dlg, msg, L"Restart adapter", MB_ICONWARNING);
+        _snwprintf(t->status, 256, L"Restart failed: %s", detail);
+        t->status_err = true;
+    } else {
+        wcscpy(t->status, L"Adapter restarted.");
+        t->status_err = false;
     }
-    collect(c);
-    fill_rows(dlg, c);
-    load_combo(dlg, c);
+    t->status[255] = L'\0';
+    reload(t);
 }
+
+/* ---------------------------------------------------------------- dialog */
 
 static INT_PTR CALLBACK tune_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 {
-    tune_ctx *c = (tune_ctx *)GetWindowLongPtrW(dlg, DWLP_USER);
+    tune_ctx *t = (tune_ctx *)GetWindowLongPtrW(dlg, DWLP_USER);
 
     switch (msg) {
-    case WM_INITDIALOG: {
-        c = (tune_ctx *)lp;
-        SetWindowLongPtrW(dlg, DWLP_USER, (LONG_PTR)c);
+    case WM_INITDIALOG:
+        t = (tune_ctx *)lp;
+        SetWindowLongPtrW(dlg, DWLP_USER, (LONG_PTR)t);
+        t->dlg = dlg;
+        ui_fonts_make(&t->f, ui_dpi(dlg));
+        ui_theme_window(dlg);
 
-        HWND lv = GetDlgItem(dlg, IDC_TUNE_LIST);
-        ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-        static const wchar_t *cols[3] = { L"Group", L"Setting", L"Value" };
-        static const int widths[3] = { 150, 210, 200 };
-        for (int i = 0; i < 3; ++i) {
-            LVCOLUMNW col = { .mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
-                              .iSubItem = i, .pszText = (LPWSTR)cols[i], .cx = widths[i] };
-            ListView_InsertColumn(lv, i, &col);
-        }
+        t->panel = ui_panel(dlg, IDC_TUNE_PANEL, paint_content, t);
+        ui_control(t->panel, IDC_TUNE_RESTART, UI_BUTTON, L"Restart adapter", false);
+        ui_control(dlg, IDC_TUNE_APPLY, UI_PRIMARY, L"Apply", false);
+        ui_control(dlg, IDOK, UI_BUTTON, L"Close", false);
 
-        wchar_t head[256];
-        _snwprintf(head, 256, L"Adapter properties for %s, and the active power scheme.",
-                   c->adapter_name[0] ? c->adapter_name : L"this adapter");
-        head[255] = L'\0';
-        SetDlgItemTextW(dlg, IDC_TUNE_FOR, head);
+        wcscpy(t->status, L"Nothing is written until you press Apply.");
+        collect(t);
+        build(t);
+        apply_fonts(t);
+        layout(t, nullptr);
+        ui_center(dlg, GetParent(dlg));
+        ShowWindow(GetDlgItem(t->panel, IDC_TUNE_RESTART), t->list->have_instance ? SW_SHOW : SW_HIDE);
+        refresh_state(t);
+        /* Not the first tab stop: that sits in the scrolling list, and focusing
+         * it would scroll the list away from its top. */
+        SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(dlg, IDOK), TRUE);
+        return FALSE;
 
-        collect(c);
-        fill_rows(dlg, c);
-        if (c->list->n > 0) ListView_SetItemState(lv, 0, LVIS_SELECTED | LVIS_FOCUSED,
-                                                  LVIS_SELECTED | LVIS_FOCUSED);
-        load_combo(dlg, c);
-
-        if (!c->list->have_instance)
-            SetDlgItemTextW(dlg, IDC_TUNE_HINT,
-                L"Could not locate this adapter's driver key, so only power settings "
-                L"are listed.");
+    case WM_ERASEBKGND:
+        SetWindowLongPtrW(dlg, DWLP_MSGRESULT, 1);
         return TRUE;
-    }
 
-    case WM_NOTIFY: {
-        NMHDR *nh = (NMHDR *)lp;
-        if (nh->idFrom == IDC_TUNE_LIST && nh->code == LVN_ITEMCHANGED) {
-            NMLISTVIEW *nv = (NMLISTVIEW *)lp;
-            if ((nv->uChanged & LVIF_STATE) && (nv->uNewState & LVIS_SELECTED))
-                load_combo(dlg, c);
+    case WM_PAINT:
+        if (t) paint_frame(t);
+        return TRUE;
+
+    case WM_DRAWITEM:
+        return ui_draw_item((const DRAWITEMSTRUCT *)lp);
+
+    case WM_CTLCOLORLISTBOX:
+        return (INT_PTR)ui_ctlcolor((HDC)wp);
+
+    case WM_COMMAND: {
+        if (!t) return FALSE;
+        const int id = LOWORD(wp);
+        /* Owner-drawn buttons carry BS_NOTIFY, so focus changes arrive under
+         * the same IDs; only a click acts.  Esc and the close box send one. */
+        const bool click = HIWORD(wp) == BN_CLICKED || HIWORD(wp) == BN_DOUBLECLICKED;
+
+        if (id >= IDC_TUNE_VALUE && id < IDC_TUNE_VALUE + t->list->n) {
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int k = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
+                if (k >= 0) t->list->s[id - IDC_TUNE_VALUE].sel = k;
+                refresh_state(t);
+            }
+            return TRUE;
+        }
+        switch (id) {
+        case IDC_TUNE_APPLY:   if (click) do_apply(t);   return TRUE;
+        case IDC_TUNE_RESTART: if (click) do_restart(t); return TRUE;
+        case IDOK:
+        case IDCANCEL:         if (click) EndDialog(dlg, 0); return TRUE;
         }
         return FALSE;
     }
 
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
-        case IDC_TUNE_VAL:
-            if (HIWORD(wp) == CBN_SELCHANGE && c) {
-                int i = selected_index(dlg);
-                int k = (int)SendMessageW(GetDlgItem(dlg, IDC_TUNE_VAL), CB_GETCURSEL, 0, 0);
-                if (i >= 0 && i < c->list->n && k >= 0) {
-                    c->list->s[i].sel = k;
-                    HWND lv = GetDlgItem(dlg, IDC_TUNE_LIST);
-                    set_row_value(lv, ListView_GetNextItem(lv, -1, LVNI_SELECTED),
-                                  &c->list->s[i]);
-                }
-            }
-            return TRUE;
-        case IDC_TUNE_APPLY:   if (c) do_apply(dlg, c);   return TRUE;
-        case IDC_TUNE_RESTART: if (c) do_restart(dlg, c); return TRUE;
-        case IDOK:
-        case IDCANCEL:         EndDialog(dlg, 0);         return TRUE;
-        }
+    case WM_DPICHANGED:
+        if (!t) return FALSE;
+        ui_fonts_free(&t->f);
+        ui_fonts_make(&t->f, HIWORD(wp));
+        apply_fonts(t);
+        layout(t, (const RECT *)lp);
+        return TRUE;
+
+    case WM_DESTROY:
+        if (t) ui_fonts_free(&t->f);
         return FALSE;
     }
     return FALSE;
@@ -224,15 +466,17 @@ static INT_PTR CALLBACK tune_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 
 void tune_dialog(HWND parent, const wc_guid *adapter, const wchar_t *adapter_name)
 {
-    tune_ctx c = { .adapter = *adapter };
-    wcsncpy(c.adapter_name, adapter_name ? adapter_name : L"", WC_NAME_MAX - 1);
-    c.adapter_name[WC_NAME_MAX - 1] = L'\0';
+    /* Big enough (two row tables) that it is not a stack object either. */
+    tune_ctx *t = calloc(1, sizeof *t);
+    if (!t) return;
+    t->adapter = *adapter;
+    wcsncpy(t->adapter_name, adapter_name ? adapter_name : L"", WC_NAME_MAX - 1);
 
     /* Well over a megabyte with the option tables: not a stack object. */
-    c.list = malloc(sizeof *c.list);
-    if (!c.list) return;
-
-    DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_TUNE),
-                    parent, tune_proc, (LPARAM)&c);
-    free(c.list);
+    t->list = malloc(sizeof *t->list);
+    if (t->list)
+        DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_TUNE),
+                        parent, tune_proc, (LPARAM)t);
+    free(t->list);
+    free(t);
 }
