@@ -4,8 +4,9 @@ A small Windows tray utility that does what [WLANOptimizer][orig] does — ask t
 Wi-Fi driver to stop scanning for other access points while you are connected —
 without the bugs, and with a UI that tells you whether it actually worked.
 
-Single 90 KB executable. No installer, no service, no runtime, no dependencies
-beyond what ships with Windows.
+Single 100 KB executable. No installer, no service, no runtime, no dependencies
+beyond what ships with Windows. Every push to `main` replaces it on the
+[latest release](https://github.com/sentinelb51/wificontrol/releases/latest).
 
 [orig]: https://github.com/catid/WLANOptimizer
 
