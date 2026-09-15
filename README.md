@@ -111,6 +111,34 @@ The residual risk, stated plainly: if the process is killed outright —
 stays disabled until you next start the app. Starting it fixes the machine.
 Nothing else will.
 
+## Metered
+
+The **Metered** switch, off by default, gives every saved Wi-Fi network on the
+managed adapters a *Variable* cost: pay per byte, the most restrictive cost
+Windows has. Windows Update holds back most downloads, Delivery Optimization
+stops sharing with other PCs, and OneDrive and the Store pause background sync
+and updates. Apps that read the connection cost cut back as well. Nothing about
+the radio changes; the link just carries less that you did not ask for.
+
+It is written with `netsh wlan set profileparameter cost=Variable`, which
+records the same per-network user cost as Settings. `WcmSetProperty` looks like
+the API for this and returns success, but on a Wi-Fi profile it only records an
+operator cost, which Windows ignores.
+
+Like auto config, the cost outlives the process, and it is put back the same
+way, with no journal. Settings only ever writes *Fixed*, so a network whose cost
+is exactly *Variable, set by the user* belongs to this app. It is reset to the
+Windows default whenever the switch is not in force: switched off, **Optimize**
+off, the adapter not managed, or the app exited. A run that was killed is
+repaired by the next start.
+
+Two differences from auto config. The switch is saved, so it survives a
+restart. And the cost is left in place through logoff and shutdown, so Windows
+Update gets no unmetered window before the app starts again.
+
+Turning it on overrides any network you had marked metered yourself, and
+turning it off leaves that network unmetered.
+
 ## Tuning
 
 The **Tuning...** button opens the settings that actually move Wi-Fi latency,
@@ -139,6 +167,11 @@ declares, and the rules are the same throughout:
   what lets an internal Wi-Fi card's link doze between packets. Display,
   processor, GPU and battery policy is not shown. Windows marks ASPM hidden;
   it is listed anyway. A setting this machine does not have is simply absent.
+- **Wi-Fi Direct as one dropdown.** The virtual adapters Windows puts on the
+  card for Miracast, Mobile Hotspot and Wi-Fi Direct get a single Enabled or
+  Disabled choice, matched to this card by parent device. Disabled turns those
+  features off. It applies at once and persists across restarts, like
+  disabling them in Device Manager.
 - **No before/after tracking, no undo journal.** The registry and the power
   scheme are the state. Nothing is recorded anywhere about what a value used to
   be. To undo a change, pick the other entry in the same dropdown.
@@ -167,7 +200,8 @@ It asks first, and it never happens on its own.
   `WlanGetAvailableNetworkList` or `WlanGetNetworkBssList` — all of which now
   require precise-location consent, raise a system prompt, and light up the
   location-in-use icon in the tray. Everything shown here comes from
-  `WlanEnumInterfaces` and the two BOOL opcodes, none of which are affected.
+  `WlanEnumInterfaces`, the BOOL opcodes, `WlanGetProfileList` and
+  `WcmQueryProperty`, none of which are affected.
 - **No per-notification-code filtering.** The ACM enumeration is based at
   `L2_NOTIFICATION_CODE_V2_BEGIN`, which the mingw-w64 headers do not define —
   they number it from 0 instead. Comparing against those constants would
@@ -254,12 +288,12 @@ instruction it does not have.
 | File | |
 | --- | --- |
 | `src/wlan.h`, `src/wlan_core.c` | policy: what to apply, when to retry, how to read an error |
-| `src/wlan_win32.c` | the only file that touches wlanapi |
+| `src/wlan_win32.c` | the only file that touches wlanapi, and the profile cost through WCM and netsh |
 | `src/app.c` | config, icon, worker thread, startup |
 | `src/app_ui.c` | the main window: switches, adapter cards, tray |
 | `src/ui.h`, `src/ui_draw.c`, `src/ui_ctl.c` | theme, anti-aliased drawing, owner-drawn switches and buttons, scrolling panel |
 | `src/tune.h`, `src/tune.c` | the settings model, and writing only what changed |
-| `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params`, and notes on well-known ones |
+| `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params`, notes on well-known ones, and the card's Wi-Fi Direct adapters |
 | `src/tune_power.c` | the two Wi-Fi-path power settings in the active scheme |
 | `src/tune_ui.c` | the tuning window |
 | `tests/test_core.c` | regression test per fixed defect and per recovery path |

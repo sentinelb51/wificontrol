@@ -27,9 +27,9 @@
 enum {
     CLIENT_W = 480, PAD = 16, ROW_H = 28, SWITCH_W = 44,
     OPT_SWITCH_X = 80, NUKE_LABEL_X = 148, NUKE_SWITCH_X = 240, NUKE_FOR_X = 292,
-    STATUS_TOP = 52, STATUS_H = 36, CARDS_TOP = 96,
-    CARD_H = 146, CARD_GAP = 10, CARD_EMPTY = 64, CARDS_VISIBLE = 3,
-    CARD_FOOT = 110,
+    METER_TOP = 52, STATUS_TOP = 88, STATUS_H = 36, CARDS_TOP = 132,
+    CARD_H = 168, CARD_GAP = 10, CARD_EMPTY = 64, CARDS_VISIBLE = 3,
+    CARD_FOOT = 132,
 };
 #define P(v) ui_px((v), g_f.dpi)
 
@@ -224,6 +224,19 @@ static void paint_card(ui_canvas *c, const snap_row *r, int y)
         if (rows[k].good) check_mark(c, in + P(178), ry + P(11));
     }
 
+    /* Metered belongs to each saved network, not the adapter, so it is a count. */
+    const int my = y + P(42 + 22 * 3);
+    const bool metering = active && g_snap->metered;
+    wchar_t met[48];
+    if (r->metered < 0)                wcscpy(met, L"–");
+    else if (!metering && !r->metered) wcscpy(met, L"off");
+    else _snwprintf(met, 48, L"%d of %d networks", r->metered, r->profiles);
+    met[47] = L'\0';
+    ui_text(c, g_f.body, ui_pal.text2, L"Metered", in, my, in + P(140), my + P(22), one);
+    ui_text(c, g_f.body, ui_pal.text, met, in + P(150), my, right, my + P(22), one);
+    if (metering && r->profiles > 0 && r->metered == r->profiles)
+        check_mark(c, in + P(150) + ui_text_w(c, g_f.body, met) + P(10), my + P(11));
+
     /* Footer: this adapter's status, and its Manage switch (a child window). */
     wchar_t status[256];
     row_status(r, g_snap->enabled, status, 256);
@@ -269,6 +282,11 @@ static void paint_main(HWND hwnd)
                 P(PAD), P(PAD), P(OPT_SWITCH_X), P(PAD + ROW_H), one);
         ui_text(&c, g_f.body, ui_pal.text, L"Stop scanning",
                 P(NUKE_LABEL_X), P(PAD), P(NUKE_SWITCH_X), P(PAD + ROW_H), one);
+        ui_text(&c, g_f.body, ui_pal.text, L"Metered",
+                P(PAD), P(METER_TOP), P(OPT_SWITCH_X), P(METER_TOP + ROW_H), one);
+        ui_text(&c, g_f.small, ui_pal.text2, L"Windows holds back updates and background sync",
+                P(NUKE_LABEL_X), P(METER_TOP), c.w - P(PAD), P(METER_TOP + ROW_H),
+                one | DT_END_ELLIPSIS);
 
         COLORREF ink = g_status_sev == SEV_ERR  ? ui_pal.err
                      : g_status_sev == SEV_WARN ? ui_pal.warn : ui_pal.text2;
@@ -404,6 +422,15 @@ static void set_enabled(HWND hwnd, bool on)
     PostMessageW(g_worker, WM_W_ENABLE, (WPARAM)on, 0);
 }
 
+/* Saved, unlike the arm above: a leftover cost is recognised by its value, so
+ * a stored switch cannot leave anything stuck. */
+static void set_metered(HWND hwnd, bool on)
+{
+    ui_switch_set(GetDlgItem(hwnd, IDC_METERED), on);
+    cfg_save_metered(on);
+    PostMessageW(g_worker, WM_W_METERED, (WPARAM)on, 0);
+}
+
 static void send_manage(const wc_guid *g, bool on)
 {
     manage_cmd *c = malloc(sizeof *c);
@@ -451,7 +478,8 @@ static void sync_manage(HWND hwnd)
 
 static void apply_fonts(HWND hwnd)
 {
-    static const int ids[] = { IDC_ENABLE, IDC_NUKE, IDC_NUKE_FOR, IDC_TUNE, IDC_REFRESH, IDOK };
+    static const int ids[] = { IDC_ENABLE, IDC_NUKE, IDC_NUKE_FOR, IDC_METERED,
+                               IDC_TUNE, IDC_REFRESH, IDOK };
     for (size_t i = 0; i < sizeof ids / sizeof ids[0]; ++i)
         SendMessageW(GetDlgItem(hwnd, ids[i]), WM_SETFONT, (WPARAM)g_f.body, FALSE);
     HWND cb = GetDlgItem(hwnd, IDC_NUKE_FOR);
@@ -474,6 +502,8 @@ static void layout(HWND hwnd, const RECT *at)
     SetWindowPos(GetDlgItem(hwnd, IDC_ENABLE), nullptr, P(OPT_SWITCH_X), P(PAD),
                  P(SWITCH_W), P(ROW_H), fl);
     SetWindowPos(GetDlgItem(hwnd, IDC_NUKE), nullptr, P(NUKE_SWITCH_X), P(PAD),
+                 P(SWITCH_W), P(ROW_H), fl);
+    SetWindowPos(GetDlgItem(hwnd, IDC_METERED), nullptr, P(OPT_SWITCH_X), P(METER_TOP),
                  P(SWITCH_W), P(ROW_H), fl);
     HWND cb = GetDlgItem(hwnd, IDC_NUKE_FOR);
     SetWindowPos(cb, nullptr, P(NUKE_FOR_X), P(PAD), cw - P(NUKE_FOR_X) - P(PAD), P(200), fl);
@@ -564,6 +594,7 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         for (size_t k = 0; k < sizeof NUKE_FOR / sizeof NUKE_FOR[0]; ++k)
             SendMessageW(nf, CB_ADDSTRING, 0, (LPARAM)NUKE_FOR[k].label);
         SendMessageW(nf, CB_SETCURSEL, NUKE_DEFAULT, 0);
+        ui_control(hwnd, IDC_METERED, UI_SWITCH, L"Metered", false);
         g_cards = ui_panel(hwnd, IDC_CARDS, paint_cards, nullptr);
         ui_control(hwnd, IDC_TUNE, UI_LINK, L"Tuning  ›", false);
         ui_control(hwnd, IDC_REFRESH, UI_LINK, L"Refresh", false);
@@ -597,6 +628,7 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         free(g_snap);
         g_snap = (snapshot *)lp;
         ui_switch_set(GetDlgItem(hwnd, IDC_ENABLE), g_snap && g_snap->enabled);
+        ui_switch_set(GetDlgItem(hwnd, IDC_METERED), g_snap && g_snap->metered);
         sync_manage(hwnd);
         InvalidateRect(g_cards, nullptr, FALSE);
         update_status(hwnd);
@@ -640,6 +672,9 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             set_nuclear(hwnd, on);
             return TRUE;
         }
+        case IDC_METERED:
+            if (click) set_metered(hwnd, !ui_switch_get(GetDlgItem(hwnd, IDC_METERED)));
+            return TRUE;
         case IDC_REFRESH:
             if (click) PostMessageW(g_worker, WM_W_POLL, 0, 0);
             return TRUE;
@@ -686,7 +721,10 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ENDSESSION:
         /* Logging off or shutting down: WM_DESTROY is not guaranteed to run,
          * and auto config would survive the reboot still disabled.  Send, not
-         * post, so the worker has actually written it before we return. */
+         * post, so the worker has actually written it before we return.  A
+         * metered cost is left in place on purpose: the next start applies or
+         * repairs it from the saved switch, and Windows Update gets no
+         * unmetered window before then. */
         if (wp && g_worker) SendMessageW(g_worker, WM_W_NUCLEAR, 0, 0);
         return TRUE;
 

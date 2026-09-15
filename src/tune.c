@@ -14,8 +14,9 @@ int tune_apply(tune_list *l, unsigned long *first_err)
          * itself, and no notion of what it was before. */
         if (s->sel < 0 || s->sel == s->cur) continue;
 
-        unsigned long e = (s->src == TUNE_DRIVER) ? tune_write_driver(l, s)
-                                                  : tune_write_power(s);
+        unsigned long e = s->src == TUNE_DRIVER ? tune_write_driver(l, s)
+                        : s->src == TUNE_POWER  ? tune_write_power(s)
+                                                : tune_write_wfd(l, s);
         if (e != ERROR_SUCCESS) {
             if (!*first_err) *first_err = e;
             continue;

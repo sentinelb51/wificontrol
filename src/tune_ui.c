@@ -42,8 +42,9 @@ typedef struct {
     HWND       dlg, panel;
     trow       driver[TUNE_MAX_SETTINGS], power[TUNE_MAX_SETTINGS];
     int        n_driver, n_power;
+    int        wfd;                             /* the Wi-Fi Direct setting, or -1 */
     int        driver_y[TUNE_MAX_SETTINGS + 1]; /* each adapter row's offset below driver_top */
-    int        driver_top, driver_hint, power_top, power_hint, content;
+    int        driver_top, driver_hint, wfd_top, wfd_hint, power_top, power_hint, content;
     wchar_t    status[256];
     bool       status_err;
 } tune_ctx;
@@ -52,6 +53,7 @@ static void collect(tune_ctx *t)
 {
     memset(t->list, 0, sizeof *t->list);
     tune_collect_driver(t->list, &t->adapter);
+    tune_collect_wfd(t->list);
     tune_collect_power(t->list);
 }
 
@@ -130,6 +132,24 @@ static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll
             L"Read by the driver when it starts: restart the adapter to use a change.",
             P(PAD) + P(2), y, cv->w - P(PAD) - P(RESTART_W) - P(12), y + P(HINT_H), one);
 
+    /* Wi-Fi Direct, only when the card has the virtual adapters at all */
+    if (t->wfd >= 0) {
+        const tune_setting *s = &l->s[t->wfd];
+        y = t->wfd_top - scroll;
+        ui_text(cv, t->f.bold, ui_pal.text, L"Wi-Fi Direct",
+                P(PAD) + P(2), y - P(SECTION_H), right, y - P(8), DT_SINGLELINE | DT_BOTTOM);
+        paint_card_frame(t, cv, y, t->wfd_hint - scroll);
+        if (row_pending(l, (trow){ t->wfd, -1 })) paint_marker(t, cv, y, t->wfd_hint - scroll);
+        ui_text(cv, t->f.body, ui_pal.text, s->name, in, y, right - P(COMBO_W) - P(12),
+                y + head_h(t, s), one);
+        ui_text(cv, t->f.small, ui_pal.text2, s->help, in, y + P(HELP_Y), right,
+                y + P(HELP_Y + HELP_H), one);
+        y = t->wfd_hint - scroll;
+        ui_text(cv, t->f.small, ui_pal.text2,
+                L"Applied to the devices when you press Apply, and kept across restarts.",
+                P(PAD) + P(2), y, cv->w - P(PAD), y + P(HINT_H), one);
+    }
+
     /* Power */
     y = t->power_top - scroll;
     ui_text(cv, t->f.bold, ui_pal.text, L"Power",
@@ -204,10 +224,15 @@ static void build(tune_ctx *t)
 
     const tune_list *l = t->list;
     t->n_driver = t->n_power = 0;
+    t->wfd = -1;
     for (int i = 0; i < l->n; ++i) {
         const tune_setting *s = &l->s[i];
         if (s->src == TUNE_DRIVER) {
             t->driver[t->n_driver++] = (trow){ i, -1 };
+            continue;
+        }
+        if (s->src == TUNE_DEVICE) {
+            t->wfd = i;
             continue;
         }
         /* tune_collect_power adds plugged in, then on battery. */
@@ -252,7 +277,13 @@ static void layout(tune_ctx *t, const RECT *at)
         t->driver_y[k + 1] = t->driver_y[k] + row_h(t, &t->list->s[t->driver[k].ac]);
     t->driver_top  = P(SECTION_H);
     t->driver_hint = t->driver_top + (t->n_driver ? t->driver_y[t->n_driver] : P(ROW_H));
-    t->power_top   = t->driver_hint + P(HINT_H) + P(SECTION_H);
+    int next       = t->driver_hint + P(HINT_H) + P(SECTION_H);
+    if (t->wfd >= 0) {
+        t->wfd_top  = next;
+        t->wfd_hint = t->wfd_top + row_h(t, &t->list->s[t->wfd]);
+        next        = t->wfd_hint + P(HINT_H) + P(SECTION_H);
+    }
+    t->power_top   = next;
     t->power_hint  = t->power_top + (t->n_power ? t->n_power * P(POWER_ROW_H) : P(ROW_H));
     t->content     = t->power_hint + P(HINT_H);
 
@@ -284,6 +315,10 @@ static void layout(tune_ctx *t, const RECT *at)
         place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver[k].ac), right - P(COMBO_W),
               ry + (head_h(t, &l->s[t->driver[k].ac]) - combo_h) / 2, P(COMBO_W), P(300));
     }
+    if (t->wfd >= 0)
+        place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->wfd), right - P(COMBO_W),
+              t->wfd_top - scroll + (head_h(t, &l->s[t->wfd]) - combo_h) / 2,
+              P(COMBO_W), P(300));
     const int in   = P(PAD) + P(14);
     const int ac_x = in + P(POWER_LABEL_W);
     const int dc_x = in + P(POWER_LABEL_W + POWER_COMBO_W + 20 + POWER_LABEL_W);

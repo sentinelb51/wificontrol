@@ -38,7 +38,8 @@ WLDFLAGS = -municode -mwindows $(OPT) $(if $(ARCH),-march=$(ARCH)) \
            -Wl,--gc-sections -s \
            -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va
 WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32 \
-           -lsetupapi -lpowrprof -ladvapi32 -luuid -luxtheme -ldwmapi
+           -lsetupapi -lcfgmgr32 -lpowrprof -ladvapi32 -luuid -luxtheme -ldwmapi \
+           -liphlpapi
 
 WSRC     = src/app.c src/app_ui.c src/ui_draw.c src/ui_ctl.c \
            src/wlan_core.c src/wlan_win32.c \

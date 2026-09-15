@@ -17,11 +17,11 @@
 #define TUNE_TEXT_MAX      96
 #define TUNE_KEY_MAX       64
 
-typedef enum { TUNE_DRIVER = 0, TUNE_POWER = 1 } tune_src;
+typedef enum { TUNE_DRIVER = 0, TUNE_POWER = 1, TUNE_DEVICE = 2 } tune_src;
 
 typedef struct {
     wchar_t raw  [TUNE_KEY_MAX];  /* driver: the string written to the registry */
-    unsigned long index;          /* power:  the value index                    */
+    unsigned long index;          /* power:  the value index; device: DICS_ENABLE or DICS_DISABLE */
     wchar_t label[TUNE_TEXT_MAX]; /* what the system calls this choice          */
 } tune_option;
 
@@ -53,8 +53,14 @@ typedef struct {
 void tune_collect_driver(tune_list *l, const wc_guid *adapter);
 void tune_collect_power (tune_list *l);
 
+/* The Wi-Fi Direct virtual adapters Windows puts on this card, as one Enabled
+ * or Disabled choice.  Absent when the card has none.  Runs after
+ * tune_collect_driver, which finds the card. */
+void tune_collect_wfd   (tune_list *l);
+
 unsigned long tune_write_driver(const tune_list *l, const tune_setting *s);
 unsigned long tune_write_power (const tune_setting *s);
+unsigned long tune_write_wfd   (const tune_list *l, const tune_setting *s);
 unsigned long tune_power_commit(void);
 
 /* Write only the settings whose dropdown differs from what was read.  Returns

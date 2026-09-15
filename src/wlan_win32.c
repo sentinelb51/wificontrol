@@ -1,5 +1,8 @@
-/* wlan_win32.c -- the only file that talks to wlanapi. */
+/* wlan_win32.c -- the only file that talks to wlanapi, and to the cost of the
+ * profiles it lists. */
+#include <winsock2.h> /* before windows.h, which iphlpapi needs */
 #include "wlan_win32.h"
+#include <iphlpapi.h>
 #include <stdio.h>
 
 /* Not present in the mingw-w64 headers; values follow the Windows SDK. */
@@ -9,6 +12,16 @@
 #define WLAN_WRITE_ACCESS   (WLAN_READ_ACCESS | WLAN_EXECUTE_ACCESS | \
                              STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA)
 #endif
+
+/* Neither is wcmapi.h.  The one call needed is declared from the SDK and bound
+ * at runtime, so on Windows 7, which has no WCM API, reading a cost is simply
+ * unsupported. */
+typedef struct { DWORD cost, source; } wcm_cost_data;  /* WCM_CONNECTION_COST_DATA */
+enum { WCM_INTF_PROPERTY_CONNECTION_COST = 4 };        /* wcm_intf_property_connection_cost */
+typedef DWORD (WINAPI *wcm_query_fn)(const GUID *, LPCWSTR, int, PVOID, PDWORD, PBYTE *);
+typedef VOID  (WINAPI *wcm_free_fn)(PVOID);
+static wcm_query_fn wcm_query;
+static wcm_free_fn  wcm_free;
 
 static WLAN_INTF_OPCODE opcode_of(wc_opt o)
 {
@@ -121,6 +134,118 @@ static unsigned long be_granted(void *ctx, wc_opt o, int *can_write)
     return ERROR_SUCCESS;
 }
 
+/* ------------------------------------------------------------ profile cost */
+
+/* Neither of these is location-gated: only BSSID-bearing calls are. */
+static unsigned long be_profiles(void *ctx, const wc_guid *g, wc_profile *out, int cap, int *count)
+{
+    wc_win32 *w = ctx;
+    PWLAN_PROFILE_INFO_LIST list = NULL;
+    GUID id;
+    memcpy(&id, g->b, sizeof id);
+
+    *count = 0;
+    DWORD e = WlanGetProfileList(w->h, &id, NULL, &list);
+    if (e != ERROR_SUCCESS) return e;
+    if (!list) return WC_E_BADDATA;
+
+    int n = 0;
+    for (DWORD i = 0; i < list->dwNumberOfItems && n < cap; ++i) {
+        /* A name that does not convert cleanly is skipped, never written back
+         * under a mangled spelling. */
+        const WCHAR *src = list->ProfileInfo[i].strProfileName;
+        int len = (int)wcsnlen(src, WLAN_MAX_NAME_LENGTH);
+        int b = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, src, len,
+                                    out[n].name, WC_PROFILE_MAX - 1, NULL, NULL);
+        if (len && b > 0) { out[n].name[b] = '\0'; n++; }
+    }
+    *count = n;
+    WlanFreeMemory(list);
+    return ERROR_SUCCESS;
+}
+
+static bool profile_w(const char *utf8, wchar_t *out)
+{
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1,
+                               out, WLAN_MAX_NAME_LENGTH + 1) > 0;
+}
+
+static unsigned long be_query_cost([[maybe_unused]] void *ctx, const wc_guid *g,
+                                   const char *profile, unsigned long *cost, int *source)
+{
+    if (!wcm_query) return ERROR_NOT_SUPPORTED;
+
+    wchar_t name[WLAN_MAX_NAME_LENGTH + 1];
+    if (!profile_w(profile, name)) return ERROR_INVALID_NAME;
+    GUID id;
+    memcpy(&id, g->b, sizeof id);
+
+    DWORD size = 0;
+    PBYTE data = NULL;
+    DWORD e = wcm_query(&id, name, WCM_INTF_PROPERTY_CONNECTION_COST, NULL, &size, &data);
+    if (e != ERROR_SUCCESS) return e;
+    if (!data) return WC_E_BADDATA;
+    if (size < sizeof(wcm_cost_data)) { wcm_free(data); return WC_E_BADDATA; }
+
+    wcm_cost_data d;
+    memcpy(&d, data, sizeof d);
+    wcm_free(data);
+    *cost   = d.cost;
+    *source = (int)d.source;
+    return ERROR_SUCCESS;
+}
+
+/* Written through netsh, not WcmSetProperty.  Measured on Windows 11:
+ * WcmSetProperty succeeds on a Wi-Fi profile but only records an operator
+ * cost, which Windows ignores for Wi-Fi, so the effective cost never moves.
+ * `netsh wlan set profileparameter cost=` records the same user cost the
+ * Settings app does, takes effect at once, and is documented. */
+static unsigned long be_set_metered([[maybe_unused]] void *ctx, const wc_guid *g,
+                                    const char *profile, int metered)
+{
+    GUID id;
+    memcpy(&id, g->b, sizeof id);
+
+    /* netsh names an interface by its alias, not its GUID.  Naming it keeps a
+     * profile two adapters share from being written on both. */
+    NET_LUID luid;
+    wchar_t alias[IF_MAX_STRING_SIZE + 1], name[WLAN_MAX_NAME_LENGTH + 1];
+    if (ConvertInterfaceGuidToLuid(&id, &luid) != NO_ERROR ||
+        ConvertInterfaceLuidToAlias(&luid, alias, IF_MAX_STRING_SIZE + 1) != NO_ERROR)
+        return ERROR_NOT_FOUND;
+    if (!profile_w(profile, name)) return ERROR_INVALID_NAME;
+    /* Quotes delimit the arguments, so a name containing one cannot be passed. */
+    if (wcschr(name, L'"') || wcschr(alias, L'"')) return ERROR_INVALID_NAME;
+
+    wchar_t exe[MAX_PATH], cmd[1024];
+    UINT sys = GetSystemDirectoryW(exe, MAX_PATH - 12);
+    if (!sys || sys >= MAX_PATH - 12) return ERROR_PATH_NOT_FOUND;
+    wcscat(exe, L"\\netsh.exe");
+
+    int len = _snwprintf(cmd, 1024,
+                         L"\"%s\" wlan set profileparameter name=\"%s\" interface=\"%s\" cost=%s",
+                         exe, name, alias, metered ? L"Variable" : L"Default");
+    if (len < 0 || len >= 1024) return ERROR_BUFFER_OVERFLOW;
+
+    STARTUPINFOW si = { .cb = sizeof si };
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return GetLastError();
+    CloseHandle(pi.hThread);
+
+    /* About 40 ms.  The bound only stops a wedged netsh from holding up the
+     * worker, which the exit path waits on. */
+    DWORD code = 1, r = WaitForSingleObject(pi.hProcess, 3000);
+    if (r == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else                    TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+
+    if (r != WAIT_OBJECT_0) return WAIT_TIMEOUT;
+    return code ? WC_E_NETSH : ERROR_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ handle */
+
 unsigned long wcw_open(wc_win32 *w, wc_backend *out)
 {
     DWORD negotiated = 0;
@@ -129,11 +254,24 @@ unsigned long wcw_open(wc_win32 *w, wc_backend *out)
     DWORD e = WlanOpenHandle(2, NULL, &negotiated, &w->h);
     if (e != ERROR_SUCCESS) { w->h = NULL; return e; }
 
+    if (!wcm_query) {
+        HMODULE m = LoadLibraryExW(L"wcmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (m) {
+            /* Through void *: GCC warns on a direct cast between function types. */
+            wcm_free  = (wcm_free_fn)(void *)GetProcAddress(m, "WcmFreeMemory");
+            wcm_query = wcm_free ? (wcm_query_fn)(void *)GetProcAddress(m, "WcmQueryProperty")
+                                 : NULL;
+        }
+    }
+
     out->ctx           = w;
     out->enum_ifaces   = be_enum;
     out->query_bool    = be_query;
     out->set_bool      = be_set;
     out->granted_write = be_granted;
+    out->list_profiles = be_profiles;
+    out->query_cost    = be_query_cost;
+    out->set_metered   = be_set_metered;
     return ERROR_SUCCESS;
 }
 

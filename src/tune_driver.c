@@ -3,11 +3,15 @@
  * These are the entries on Device Manager's Advanced tab.  The choices are not
  * hardcoded per vendor: the driver publishes them under Ndi\Params in its
  * class-instance key, and we render exactly what it declares.
+ *
+ * Also the Wi-Fi Direct virtual adapters Windows layers on the same card,
+ * which are devices of their own rather than properties.
  */
 #include "tune.h"
 #include "wlan_win32.h"
 
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #include <devguid.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +27,14 @@ static const wchar_t *CLASS_NET =
 static const struct { const wchar_t *keyword, *help; } KNOWN[] = {
     { L"*PacketCoalescing",
       L"Batches received broadcast and multicast frames into fewer interrupts; they arrive later." },
+    { L"*InterruptModeration",
+      L"Waits for more packets or a timeout before raising a receive interrupt; packets arrive later." },
+    { L"*RscIPv4",
+      L"Hands a run of received IPv4 TCP segments to the stack as one, so only one header is processed." },
+    { L"*RscIPv6",
+      L"Hands a run of received IPv6 TCP segments to the stack as one, so only one header is processed." },
+    { L"*RSS",
+      L"Spreads receive processing over CPUs, one per connection; off, it all runs on the interrupt's CPU." },
     { L"*SelectiveSuspend",
       L"NDIS suspends the adapter after a few idle seconds; the next packet waits for it to resume." },
     { L"*DeviceSleepOnDisconnect",
@@ -269,54 +281,143 @@ unsigned long tune_write_driver(const tune_list *l, const tune_setting *s)
     return (unsigned long)r;
 }
 
-/* Disable then re-enable the device so the miniport re-reads its parameters.
- * Same thing Device Manager does when you press OK on the Advanced tab. */
-unsigned long tune_restart_adapter(const tune_list *l)
+/* ---------------------------------------------------------------- devices */
+
+/* The card itself: the network device whose driver key is the class-instance
+ * key tune_collect_driver resolved. */
+static bool find_card(const tune_list *l, HDEVINFO set, SP_DEVINFO_DATA *out)
 {
-    if (!l->have_instance) return ERROR_NOT_FOUND;
+    if (!l->have_instance) return false;
 
     /* The instance key path ends in the four digits SPDRP_DRIVER reports. */
     const wchar_t *slash = wcsrchr(l->instance_key, L'\\');
-    if (!slash) return ERROR_NOT_FOUND;
+    if (!slash) return false;
     wchar_t want[64];
     _snwprintf(want, 64, L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\%s", slash + 1);
     want[63] = L'\0';
 
+    out->cbSize = sizeof *out;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, out); ++i) {
+        wchar_t drv[64] = L"";
+        if (SetupDiGetDeviceRegistryPropertyW(set, out, SPDRP_DRIVER, nullptr,
+                                              (BYTE *)drv, sizeof drv, nullptr) &&
+            _wcsicmp(drv, want) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* DICS_ENABLE or DICS_DISABLE, for every hardware profile: what Device
+ * Manager does, and it persists across restarts. */
+static bool set_state(HDEVINFO set, SP_DEVINFO_DATA *dev, DWORD change)
+{
+    SP_PROPCHANGE_PARAMS pc = {
+        .ClassInstallHeader = { .cbSize = sizeof(SP_CLASSINSTALL_HEADER),
+                                .InstallFunction = DIF_PROPERTYCHANGE },
+        .StateChange = change,
+        .Scope = DICS_FLAG_GLOBAL,
+    };
+    return SetupDiSetClassInstallParamsW(set, dev, &pc.ClassInstallHeader, sizeof pc) &&
+           SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, dev);
+}
+
+/* Disable then re-enable the device so the miniport re-reads its parameters.
+ * Same thing Device Manager does when you press OK on the Advanced tab. */
+unsigned long tune_restart_adapter(const tune_list *l)
+{
     HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr, DIGCF_PRESENT);
     if (set == INVALID_HANDLE_VALUE) return GetLastError();
 
     unsigned long result = ERROR_NOT_FOUND;
-    SP_DEVINFO_DATA dev = { .cbSize = sizeof(SP_DEVINFO_DATA) };
-
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &dev); ++i) {
-        wchar_t drv[64] = L"";
-        if (!SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_DRIVER, nullptr,
-                                               (BYTE *)drv, sizeof drv, nullptr))
-            continue;
-        if (_wcsicmp(drv, want) != 0) continue;
-
-        SP_PROPCHANGE_PARAMS pc = {
-            .ClassInstallHeader = { .cbSize = sizeof(SP_CLASSINSTALL_HEADER),
-                                    .InstallFunction = DIF_PROPERTYCHANGE },
-            .Scope = DICS_FLAG_GLOBAL,
-        };
-
-        pc.StateChange = DICS_DISABLE;
-        if (!SetupDiSetClassInstallParamsW(set, &dev, &pc.ClassInstallHeader, sizeof pc) ||
-            !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, &dev)) {
-            result = GetLastError();
-            break;
-        }
-
-        pc.StateChange = DICS_ENABLE;
-        if (!SetupDiSetClassInstallParamsW(set, &dev, &pc.ClassInstallHeader, sizeof pc) ||
-            !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, &dev)) {
-            result = GetLastError(); /* left disabled: the caller must report this */
-            break;
-        }
-        result = ERROR_SUCCESS;
-        break;
+    SP_DEVINFO_DATA dev = { .cbSize = sizeof dev };
+    if (find_card(l, set, &dev)) {
+        if (!set_state(set, &dev, DICS_DISABLE))     result = GetLastError();
+        else if (!set_state(set, &dev, DICS_ENABLE)) result = GetLastError(); /* left disabled: the caller must report this */
+        else                                         result = ERROR_SUCCESS;
     }
     SetupDiDestroyDeviceInfoList(set);
     return result;
+}
+
+/* ----------------------------------------------------------- Wi-Fi Direct */
+
+/* The virtual adapters from vwifimp.inf: one for Wi-Fi Direct and Miracast,
+ * one for Mobile Hotspot.  Matched by parent too, so a second card's are
+ * never touched. */
+static const wchar_t WFD_HWID[] = L"{5d624f94-8850-40c3-a3fa-a4fd2080baf3}\\vwifimp_wfd";
+
+/* Count this card's Wi-Fi Direct adapters and how many are disabled, first
+ * moving each one to `change` when it is nonzero. */
+static unsigned long wfd_walk(const tune_list *l, DWORD change, int *total, int *disabled)
+{
+    *total = *disabled = 0;
+    HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr, DIGCF_PRESENT);
+    if (set == INVALID_HANDLE_VALUE) return GetLastError();
+
+    SP_DEVINFO_DATA card = { .cbSize = sizeof card }, dev = { .cbSize = sizeof dev };
+    unsigned long result = find_card(l, set, &card) ? ERROR_SUCCESS : ERROR_NOT_FOUND;
+    bool reboot = false;
+
+    for (DWORD i = 0; result == ERROR_SUCCESS && SetupDiEnumDeviceInfo(set, i, &dev); ++i) {
+        /* A multi-string: the first entry is the one to match.  Two characters
+         * short, so it always ends in a double terminator. */
+        wchar_t hwid[256] = L"";
+        DEVINST parent = 0;
+        if (!SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID, nullptr, (BYTE *)hwid,
+                                               sizeof hwid - 2 * sizeof(wchar_t), nullptr) ||
+            _wcsicmp(hwid, WFD_HWID) != 0 ||
+            CM_Get_Parent(&parent, dev.DevInst, 0) != CR_SUCCESS || parent != card.DevInst)
+            continue;
+
+        if (change) {
+            if (!set_state(set, &dev, change)) { result = GetLastError(); break; }
+            SP_DEVINSTALL_PARAMS_W ip = { .cbSize = sizeof ip };
+            if (SetupDiGetDeviceInstallParamsW(set, &dev, &ip) &&
+                (ip.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART)))
+                reboot = true;
+        }
+
+        ULONG status = 0, problem = 0;
+        (*total)++;
+        if (CM_Get_DevNode_Status(&status, &problem, dev.DevInst, 0) == CR_SUCCESS &&
+            (status & DN_HAS_PROBLEM) && problem == CM_PROB_DISABLED)
+            (*disabled)++;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return (result == ERROR_SUCCESS && reboot) ? ERROR_SUCCESS_REBOOT_REQUIRED : result;
+}
+
+void tune_collect_wfd(tune_list *l)
+{
+    int total = 0, disabled = 0;
+    if (l->n >= TUNE_MAX_SETTINGS || wfd_walk(l, 0, &total, &disabled) != ERROR_SUCCESS ||
+        total == 0)
+        return;
+
+    tune_setting *s = &l->s[l->n];
+    memset(s, 0, sizeof *s);
+    s->src = TUNE_DEVICE;
+    wcscpy(s->group, L"Wi-Fi Direct");
+    _snwprintf(s->name, TUNE_TEXT_MAX, L"Wi-Fi Direct adapters (%d)", total);
+    s->name[TUNE_TEXT_MAX - 1] = L'\0';
+    s->help = L"Miracast, Mobile Hotspot and Wi-Fi Direct share the radio through these; "
+              L"disabled, they stop.";
+
+    s->n_opt = 2;
+    wcscpy(s->opt[0].label, L"Enabled");
+    s->opt[0].index = DICS_ENABLE;
+    wcscpy(s->opt[1].label, L"Disabled");
+    s->opt[1].index = DICS_DISABLE;
+
+    /* Half and half matches neither choice; either one then sets both. */
+    s->cur = disabled == 0 ? 0 : disabled == total ? 1 : -1;
+    s->sel = s->cur;
+    l->n++;
+}
+
+unsigned long tune_write_wfd(const tune_list *l, const tune_setting *s)
+{
+    int total = 0, disabled = 0;
+    unsigned long e = wfd_walk(l, (DWORD)s->opt[s->sel].index, &total, &disabled);
+    return (e == ERROR_SUCCESS && total == 0) ? ERROR_NOT_FOUND : e;
 }

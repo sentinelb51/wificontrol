@@ -17,6 +17,7 @@
 #define WM_W_MANAGE   (WM_APP + 12)
 #define WM_W_QUIT     (WM_APP + 13)
 #define WM_W_NUCLEAR  (WM_APP + 14)
+#define WM_W_METERED  (WM_APP + 15)
 
 typedef struct {
     wc_guid       guid;
@@ -24,12 +25,13 @@ typedef struct {
     wc_ifstate    state;
     bool          present, managed, pending;
     wc_val        streaming, bgscan, autoconf;
+    int           profiles, metered;
     unsigned long last_err;
 } snap_row;
 
 typedef struct {
     int           n;
-    bool          enabled, write_denied, nuclear;
+    bool          enabled, write_denied, nuclear, metered;
     int           recovered;
     unsigned long enum_err, open_err;
     snap_row      row[WC_MAX_ADAPTERS];
@@ -43,6 +45,7 @@ extern UINT g_msg_show;  /* broadcast by a second instance to reveal the first *
 
 void  cfg_save_enabled(bool on);
 void  cfg_save_managed(const wc_guid *g, bool on);
+void  cfg_save_metered(bool on);
 void  cfg_save_dark(bool on);
 HICON make_icon(int size, COLORREF c);
 

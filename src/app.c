@@ -26,7 +26,7 @@
 #define WATCHDOG_MS 60000
 
 typedef struct { wc_guid g; bool managed; } cfg_entry;
-typedef struct { bool enabled, dark; int n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
+typedef struct { bool enabled, dark, metered; int n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
 
 /* ----------------------------------------------------------------- config */
 
@@ -80,6 +80,7 @@ static void cfg_load(cfg *c)
     memset(c, 0, sizeof *c);
     c->enabled = GetPrivateProfileIntW(L"general", L"enabled", 1, g_cfg_path) != 0;
     c->dark    = GetPrivateProfileIntW(L"general", L"dark", 1, g_cfg_path) != 0;
+    c->metered = GetPrivateProfileIntW(L"general", L"metered", 0, g_cfg_path) != 0;
 
     /* Adapters absent from the file default to managed. */
     wchar_t buf[4096];
@@ -108,6 +109,11 @@ void cfg_save_enabled(bool on)
 void cfg_save_dark(bool on)
 {
     WritePrivateProfileStringW(L"general", L"dark", on ? L"1" : L"0", g_cfg_path);
+}
+
+void cfg_save_metered(bool on)
+{
+    WritePrivateProfileStringW(L"general", L"metered", on ? L"1" : L"0", g_cfg_path);
 }
 
 void cfg_save_managed(const wc_guid *g, bool on)
@@ -232,6 +238,7 @@ static void worker_send_snapshot(void)
     s->n          = g_core.n;
     s->enabled    = g_core.enabled;
     s->nuclear    = g_core.nuclear;
+    s->metered    = g_core.metered;
     s->recovered  = g_core.recovered;
     s->write_denied = wc_write_denied(&g_core);
     s->enum_err   = g_core.enum_err;
@@ -248,6 +255,8 @@ static void worker_send_snapshot(void)
         r->streaming = a->streaming;
         r->bgscan    = a->bgscan;
         r->autoconf  = a->autoconf;
+        r->profiles  = a->profiles;
+        r->metered   = a->metered;
         r->last_err  = a->last_err;
         MultiByteToWideChar(CP_UTF8, 0, a->name, -1, r->name, WC_NAME_MAX);
         r->name[WC_NAME_MAX - 1] = L'\0';
@@ -303,6 +312,11 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         worker_send_snapshot();
         return 0;
 
+    case WM_W_METERED:
+        wc_set_metered(&g_core, (int)wp);
+        worker_send_snapshot();
+        return 0;
+
     case WM_W_MANAGE: {
         manage_cmd *c = (manage_cmd *)lp;
         if (c) {
@@ -317,11 +331,13 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_W_QUIT:
         KillTimer(hwnd, T_DEBOUNCE);
         KillTimer(hwnd, T_WATCHDOG);
-        /* Auto config does not come back on its own, so disarm and re-apply
-         * while the handle is still open.  The other two settings need no
-         * such help: closing the handle hands them straight back. */
+        /* Auto config and a metered cost do not come back on their own, so
+         * switch both off and re-apply while the handle is still open.  The
+         * other two settings need no such help: closing the handle hands them
+         * straight back. */
         if (g_win32.h) {
             g_core.nuclear = false;
+            g_core.metered = false;
             wc_poll(&g_core);
         }
         wcw_unregister(&g_win32);
@@ -359,6 +375,7 @@ static unsigned __stdcall worker_main([[maybe_unused]] void *param)
          * so an adapter the user unchecked is never briefly optimized. */
         wc_refresh(&g_core);
         g_core.enabled = g_boot_cfg.enabled;
+        g_core.metered = g_boot_cfg.metered;
         for (int i = 0; i < g_boot_cfg.n; ++i) {
             int j = wc_find(&g_core, &g_boot_cfg.e[i].g);
             if (j >= 0) g_core.ad[j].managed = g_boot_cfg.e[i].managed;

@@ -2,11 +2,15 @@
  * a regression test for a specific defect in the original WLANOptimizer. */
 #include "../src/wlan.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
 #define CHECK(cond) do { if (!(cond)) { \
     printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
+
+#define COST_UNRESTRICTED 0x1UL
+#define COST_FIXED        0x2UL
 
 /* ------------------------------------------------------------------ fake */
 
@@ -20,6 +24,12 @@ typedef struct {
     int           nq, ns;               /* call counts */
     int           nset[4];              /* writes per adapter */
     bool          can_write[WC_OPT_COUNT];
+
+    int           nprof[4];             /* saved profiles per adapter */
+    unsigned long cost[4][8];           /* each profile's cost and its source */
+    int           csrc[4][8];
+    unsigned long c_err;                /* fails every cost read */
+    int           ncq, ncs;             /* cost reads and writes */
 } fake;
 
 static int fake_index(const fake *f, const wc_guid *g)
@@ -64,6 +74,38 @@ static unsigned long f_granted(void *ctx, wc_opt o, int *w)
     *w = f->can_write[o] ? 1 : 0;
     return WC_OK;
 }
+/* Profiles are named by their index. */
+static unsigned long f_profiles(void *ctx, const wc_guid *g, wc_profile *out, int cap, int *count)
+{
+    fake *f = ctx;
+    int i = fake_index(f, g);
+    if (i < 0) return WC_E_BADDATA;
+    int n = f->nprof[i] < cap ? f->nprof[i] : cap;
+    for (int k = 0; k < n; ++k) snprintf(out[k].name, WC_PROFILE_MAX, "%d", k);
+    *count = n;
+    return WC_OK;
+}
+static unsigned long f_qcost(void *ctx, const wc_guid *g, const char *p, unsigned long *cost, int *src)
+{
+    fake *f = ctx;
+    f->ncq++;
+    if (f->c_err) return f->c_err;
+    int i = fake_index(f, g);
+    if (i < 0) return WC_E_BADDATA;
+    *cost = f->cost[i][atoi(p)];
+    *src  = f->csrc[i][atoi(p)];
+    return WC_OK;
+}
+static unsigned long f_setmet(void *ctx, const wc_guid *g, const char *p, int metered)
+{
+    fake *f = ctx;
+    f->ncs++;
+    int i = fake_index(f, g);
+    if (i < 0) return WC_E_BADDATA;
+    f->cost[i][atoi(p)] = metered ? WC_COST_VARIABLE : COST_UNRESTRICTED;
+    f->csrc[i][atoi(p)] = metered ? WC_COST_SRC_USER : 0;
+    return WC_OK;
+}
 
 static void fake_init(fake *f, int nifs)
 {
@@ -79,12 +121,16 @@ static void fake_init(fake *f, int nifs)
         f->val[i][WC_OPT_STREAMING] = 0;              /* OS defaults */
         f->val[i][WC_OPT_BGSCAN]    = f->raw_true;
         f->val[i][WC_OPT_AUTOCONF]  = f->raw_true;
+        for (int k = 0; k < 8; ++k) f->cost[i][k] = COST_UNRESTRICTED;
     }
 }
 
 static void bind(wc_state *s, fake *f)
 {
-    wc_backend be = { f, f_enum, f_query, f_set, f_granted };
+    wc_backend be = { .ctx = f, .enum_ifaces = f_enum, .query_bool = f_query,
+                      .set_bool = f_set, .granted_write = f_granted,
+                      .list_profiles = f_profiles, .query_cost = f_qcost,
+                      .set_metered = f_setmet };
     wc_init(s, &be);
 }
 
@@ -360,6 +406,96 @@ static void t_probe_is_advisory(void)
     CHECK(f.val[0][WC_OPT_BGSCAN] == 0); /* attempted anyway, and it worked */
 }
 
+/* ---- metered: a profile cost that outlives the process ---------------- */
+
+static void t_metered_marks_every_profile(void)
+{
+    printf("metering marks every saved profile, then stops writing\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.nprof[0] = 3;
+
+    wc_poll(&s);
+    CHECK(f.ncs == 0);                       /* off by default: nothing written */
+
+    wc_set_metered(&s, true);
+    for (int k = 0; k < 3; ++k) CHECK(f.cost[0][k] == WC_COST_VARIABLE);
+    CHECK(s.ad[0].metered == 3);
+    CHECK(s.ad[0].profiles == 3);
+    CHECK(s.ad[0].last_err == WC_OK);
+
+    int writes = f.ncs;
+    wc_poll(&s);
+    CHECK(f.ncs == writes);
+}
+
+static void t_metered_repairs_only_its_own_cost(void)
+{
+    /* A killed run leaves Variable behind.  A network the user made metered in
+     * Settings reads Fixed, and has to survive the repair untouched. */
+    printf("startup resets a leftover metered cost, and nothing else\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.nprof[0] = 2;
+    f.cost[0][0] = WC_COST_VARIABLE; f.csrc[0][0] = WC_COST_SRC_USER; /* ours */
+    f.cost[0][1] = COST_FIXED;       f.csrc[0][1] = WC_COST_SRC_USER; /* the user's */
+
+    wc_poll(&s);
+    CHECK(f.cost[0][0] == COST_UNRESTRICTED);
+    CHECK(f.cost[0][1] == COST_FIXED);
+    CHECK(f.ncs == 1);
+    CHECK(s.ad[0].metered == 0);
+
+    /* Clean and switched off: later passes do not even read the costs. */
+    int reads = f.ncq;
+    wc_poll(&s);
+    CHECK(f.ncq == reads);
+}
+
+static void t_metered_released_by_every_switch(void)
+{
+    printf("switching off, the master switch and unmanaging all reset the cost\n");
+    fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
+    f.nprof[0] = f.nprof[1] = 1;
+
+    wc_poll(&s);
+    wc_set_metered(&s, true);
+    CHECK(f.cost[0][0] == WC_COST_VARIABLE);
+    CHECK(f.cost[1][0] == WC_COST_VARIABLE);
+
+    wc_set_metered(&s, false);
+    CHECK(f.cost[0][0] == COST_UNRESTRICTED);
+    CHECK(f.cost[1][0] == COST_UNRESTRICTED);
+
+    wc_set_metered(&s, true);
+    wc_set_enabled(&s, false);
+    CHECK(f.cost[0][0] == COST_UNRESTRICTED);
+    CHECK(f.cost[1][0] == COST_UNRESTRICTED);
+
+    wc_set_enabled(&s, true);
+    wc_set_managed(&s, 1, false);
+    CHECK(f.cost[0][0] == WC_COST_VARIABLE);
+    CHECK(f.cost[1][0] == COST_UNRESTRICTED);
+
+    f.ifs[0].state = WC_IF_DISCONNECTED;     /* a cost holds while disconnected */
+    wc_poll(&s);
+    CHECK(f.cost[0][0] == WC_COST_VARIABLE);
+}
+
+static void t_metered_read_errors_quiet_when_off(void)
+{
+    /* Windows 7 has no WCM API, so every cost read fails there.  That is an
+     * error only for someone who asked for metering. */
+    printf("cost read failures are reported only while metering is on\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.nprof[0] = 1;
+    f.c_err = 50; /* ERROR_NOT_SUPPORTED */
+
+    wc_poll(&s);
+    CHECK(s.ad[0].last_err == WC_OK);
+
+    wc_set_metered(&s, true);
+    CHECK(s.ad[0].last_err == 50);
+}
+
 int main(void)
 {
     t_applies_and_is_idempotent();
@@ -379,6 +515,10 @@ int main(void)
     t_disarm_and_master_off_restore();
     t_unmanaged_keeps_autoconf();
     t_autoconf_error_is_not_swallowed();
+    t_metered_marks_every_profile();
+    t_metered_repairs_only_its_own_cost();
+    t_metered_released_by_every_switch();
+    t_metered_read_errors_quiet_when_off();
 
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall checks passed\n");

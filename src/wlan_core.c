@@ -69,6 +69,7 @@ unsigned long wc_refresh(wc_state *s)
             s->ad[j].streaming = WC_VAL_UNKNOWN;
             s->ad[j].bgscan    = WC_VAL_UNKNOWN;
             s->ad[j].autoconf  = WC_VAL_UNKNOWN;
+            s->ad[j].metered   = -1;   /* its profiles have never been checked */
         }
         memcpy(s->ad[j].name, tmp[i].name, sizeof s->ad[j].name);
         s->ad[j].name[WC_NAME_MAX - 1] = '\0';
@@ -133,6 +134,49 @@ static void apply_autoconf(wc_state *s, wc_adapter *a)
     if (desired) s->recovered++;
 }
 
+/* The same positive check, per saved profile: a profile is ours exactly when
+ * it carries the cost we write, and it should be ours exactly while metering is
+ * in force.  A cost can be written connected or not, so the network is metered
+ * before the first packet of its next connection. */
+static void apply_metered(wc_state *s, wc_adapter *a)
+{
+    const bool want = s->enabled && s->metered && a->managed;
+
+    /* A clean pass found nothing of ours and nothing is wanted: skip the
+     * per-profile reads until something changes that. */
+    if ((!want && a->metered == 0) || !s->be.list_profiles) return;
+
+    /* Around 50 KB, so not a stack object.  The core runs on one thread. */
+    static wc_profile prof[WC_MAX_PROFILES];
+    int n = 0;
+    unsigned long e = s->be.list_profiles(s->be.ctx, &a->guid, prof, WC_MAX_PROFILES, &n);
+    if (e != WC_OK) { if (want && !a->last_err) a->last_err = e; return; }
+
+    int ours = 0;
+    bool clean = true;
+    for (int k = 0; k < n; ++k) {
+        /* A failed read is an error only for someone who asked for metering.
+         * Without the WCM API (Windows 7) every read fails, and that must not
+         * paint an error under a switch nobody turned on. */
+        unsigned long cost = 0;
+        int src = 0;
+        e = s->be.query_cost(s->be.ctx, &a->guid, prof[k].name, &cost, &src);
+        if (e != WC_OK) { clean = false; if (want && !a->last_err) a->last_err = e; continue; }
+
+        bool is_ours = (cost & WC_COST_VARIABLE) && src == WC_COST_SRC_USER;
+        if (is_ours != want) {
+            e = s->be.set_metered(s->be.ctx, &a->guid, prof[k].name, want);
+            if (e == WC_OK) is_ours = want;
+            else { clean = false; if (!a->last_err) a->last_err = e; }
+        }
+        if (is_ours) ours++;
+    }
+    a->profiles = n;
+    /* After a failure with metering off, "unknown" makes the next pass look
+     * again instead of skipping a profile that may still be ours. */
+    a->metered = (clean || want) ? ours : -1;
+}
+
 void wc_apply_one(wc_state *s, int i)
 {
     if (i < 0 || i >= s->n) return;
@@ -145,9 +189,11 @@ void wc_apply_one(wc_state *s, int i)
      * early return.  apply_opcode keeps the first error rather than the last. */
     a->last_err = WC_OK;
 
-    /* Runs before every early return: auto config must be repaired even for an
-     * adapter that is disconnected, unmanaged, or switched off. */
+    /* Run before every early return: auto config and a metered cost must be
+     * repaired even for an adapter that is disconnected, unmanaged, or
+     * switched off. */
     apply_autoconf(s, a);
+    apply_metered(s, a);
 
     /* Nothing to do and nothing to undo. */
     if (!want && !a->touched) {
@@ -207,6 +253,12 @@ void wc_set_nuclear(wc_state *s, bool on)
     wc_apply_all(s);
 }
 
+void wc_set_metered(wc_state *s, bool on)
+{
+    s->metered = on;
+    wc_apply_all(s);
+}
+
 void wc_set_managed(wc_state *s, int i, bool on)
 {
     if (i < 0 || i >= s->n) return;
@@ -243,6 +295,7 @@ const char *wc_strerror(unsigned long code)
     switch (code) {
     case WC_E_VERIFY:  return "setting did not stick (driver rejected it)";
     case WC_E_BADDATA: return "driver returned an unexpected value";
+    case WC_E_NETSH:   return "netsh refused to change a network's cost";
     default:           return (code >= WC_E_APP) ? "unknown internal error" : nullptr;
     }
 }
