@@ -13,16 +13,10 @@
 #define WC_MAX_PROFILES 64
 #define WC_PROFILE_MAX  769 /* UTF-8 bytes: a 256-character profile name and its terminator */
 
-/* Status codes are Win32 DWORDs so the backend can pass them through
- * untranslated; the UI decodes them with FormatMessage.  Codes at or above
- * WC_E_APP are ours and are decoded from wc_strerror(). */
-#define WC_OK                0UL
-#define WC_E_ACCESS_DENIED   5UL    /* ERROR_ACCESS_DENIED */
-#define WC_E_INVALID_STATE   5023UL /* ERROR_INVALID_STATE: adapter not connected */
-#define WC_E_APP             0xE0000000UL
-#define WC_E_VERIFY          0xE0000001UL /* wrote the value, read back something else */
-#define WC_E_BADDATA         0xE0000002UL /* driver returned a short/absent buffer */
-#define WC_E_NETSH           0xE0000003UL /* netsh refused to change a profile's cost */
+/* The status codes, and the words for a failure, live in diag.h: the log the
+ * window shows is filled from here, and its policy is as host-testable as
+ * this file's. */
+#include "diag.h"
 
 typedef struct { unsigned char b[16]; } wc_guid;
 
@@ -92,6 +86,12 @@ typedef struct wc_backend {
     unsigned long (*set_metered)  (void *ctx, const wc_guid *g, const char *profile, int metered);
 } wc_backend;
 
+/* Every failure is handed to this as well as kept in the adapter's last_err,
+ * so the window can say which setting on which adapter, instead of showing one
+ * code for the whole pass.  Optional: the core works with no sink at all. */
+typedef void (*wc_note_fn)(void *ctx, diag_op op, diag_step step, const char *subject,
+                           unsigned long code);
+
 typedef struct {
     wc_guid       guid;
     char          name[WC_NAME_MAX];
@@ -120,9 +120,12 @@ typedef struct {
     int           n;
     bool          can_write[WC_OPT_COUNT]; /* advisory: from WlanGetSecuritySettings */
     unsigned long enum_err;
+    wc_note_fn    note;                    /* where failures are reported, or nullptr */
+    void         *note_ctx;
 } wc_state;
 
 void          wc_init            (wc_state *s, const wc_backend *be);
+void          wc_set_note        (wc_state *s, wc_note_fn note, void *ctx);
 void          wc_probe_access    (wc_state *s);
 unsigned long wc_refresh         (wc_state *s);      /* enumerate, merge, keep user flags */
 void          wc_apply_all       (wc_state *s);
@@ -142,6 +145,5 @@ int           wc_find            (const wc_state *s, const wc_guid *g); /* -1 if
 bool          wc_write_denied(const wc_state *s);
 
 const char   *wc_state_name(wc_ifstate st);
-const char   *wc_strerror   (unsigned long code); /* only for WC_E_APP codes; else NULL */
 
 #endif /* WIFICONTROL_WLAN_H */

@@ -170,6 +170,46 @@ static bool profile_w(const char *utf8, wchar_t *out)
                                out, WLAN_MAX_NAME_LENGTH + 1) > 0;
 }
 
+/* Bound at runtime, once: on Windows 7 there is no WCM API at all, and a
+ * missing export must read as "not supported here", not as a failure. */
+static bool load_wcm(void)
+{
+    static bool tried;
+    if (!tried) {
+        tried = true;
+        HMODULE m = LoadLibraryExW(L"wcmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (m) {
+            /* Through void *: GCC warns on a direct cast between function types. */
+            wcm_free  = (wcm_free_fn)(void *)GetProcAddress(m, "WcmFreeMemory");
+            wcm_query = wcm_free ? (wcm_query_fn)(void *)GetProcAddress(m, "WcmQueryProperty")
+                                 : NULL;
+        }
+    }
+    return wcm_query != NULL;
+}
+
+/* netsh, which is what actually writes a cost; see be_set_metered. */
+static bool netsh_path(wchar_t *out, size_t cap)
+{
+    UINT n = GetSystemDirectoryW(out, (UINT)cap - 12);
+    if (!n || n >= cap - 12) return false;
+    wcscat(out, L"\\netsh.exe");
+    return true;
+}
+
+unsigned long wcw_cost_available(void)
+{
+    if (!load_wcm()) return ERROR_NOT_SUPPORTED;
+
+    wchar_t exe[MAX_PATH];
+    if (!netsh_path(exe, MAX_PATH)) return ERROR_PATH_NOT_FOUND;
+    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) {
+        DWORD e = GetLastError();
+        return e ? e : ERROR_FILE_NOT_FOUND;
+    }
+    return ERROR_SUCCESS;
+}
+
 static unsigned long be_query_cost([[maybe_unused]] void *ctx, const wc_guid *g,
                                    const char *profile, unsigned long *cost, int *source)
 {
@@ -218,9 +258,7 @@ static unsigned long be_set_metered([[maybe_unused]] void *ctx, const wc_guid *g
     if (wcschr(name, L'"') || wcschr(alias, L'"')) return ERROR_INVALID_NAME;
 
     wchar_t exe[MAX_PATH], cmd[1024];
-    UINT sys = GetSystemDirectoryW(exe, MAX_PATH - 12);
-    if (!sys || sys >= MAX_PATH - 12) return ERROR_PATH_NOT_FOUND;
-    wcscat(exe, L"\\netsh.exe");
+    if (!netsh_path(exe, MAX_PATH)) return ERROR_PATH_NOT_FOUND;
 
     int len = _snwprintf(cmd, 1024,
                          L"\"%s\" wlan set profileparameter name=\"%s\" interface=\"%s\" cost=%s",
@@ -254,15 +292,7 @@ unsigned long wcw_open(wc_win32 *w, wc_backend *out)
     DWORD e = WlanOpenHandle(2, NULL, &negotiated, &w->h);
     if (e != ERROR_SUCCESS) { w->h = NULL; return e; }
 
-    if (!wcm_query) {
-        HMODULE m = LoadLibraryExW(L"wcmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (m) {
-            /* Through void *: GCC warns on a direct cast between function types. */
-            wcm_free  = (wcm_free_fn)(void *)GetProcAddress(m, "WcmFreeMemory");
-            wcm_query = wcm_free ? (wcm_query_fn)(void *)GetProcAddress(m, "WcmQueryProperty")
-                                 : NULL;
-        }
-    }
+    load_wcm();
 
     out->ctx           = w;
     out->enum_ifaces   = be_enum;

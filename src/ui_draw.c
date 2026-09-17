@@ -322,6 +322,20 @@ void ui_text(ui_canvas *c, HFONT f, COLORREF col, const wchar_t *s,
     SelectObject(c->dc, old);
 }
 
+/* Wrapped height, measured against a window rather than a canvas: a card has
+ * to be laid out before there is anything to paint it on. */
+int ui_text_h(HWND ref, HFONT f, const wchar_t *s, int w)
+{
+    HDC dc = GetDC(ref);
+    if (!dc) return 0;
+    HGDIOBJ old = SelectObject(dc, f);
+    RECT r = { 0, 0, w, 0 };
+    DrawTextW(dc, s, -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX);
+    SelectObject(dc, old);
+    ReleaseDC(ref, dc);
+    return r.bottom;
+}
+
 int ui_text_w(ui_canvas *c, HFONT f, const wchar_t *s)
 {
     HGDIOBJ old = SelectObject(c->dc, f);

@@ -44,7 +44,8 @@ WLIBS    = -lwlanapi -lcomctl32 -lshell32 -lgdi32 -luser32 \
 WSRC     = src/app.c src/app_ui.c src/ui_draw.c src/ui_ctl.c \
            src/wlan_core.c src/wlan_win32.c \
            src/tune.c src/tune_driver.c src/tune_power.c src/tune_ui.c \
-           src/perf.c src/perf_win32.c
+           src/perf.c src/perf_win32.c \
+           src/diag.c src/diag_ui.c
 WOBJ     = $(patsubst src/%.c,$(BUILD)/%.o,$(WSRC)) $(BUILD)/app.res.o
 
 # Some GCC builds (WinLibs, MSYS2) link a default-manifest.o into every exe.
@@ -55,6 +56,7 @@ NOMANIFEST = $(BUILD)/nomanifest/default-manifest.o
 
 TESTBIN  = $(BUILD)/test_core
 PERFTEST = $(BUILD)/test_perf
+DIAGTEST = $(BUILD)/test_diag
 TESTFLAGS= -std=$(HOSTSTD) $(WARN) -g -fsanitize=address,undefined
 
 .PHONY: all test clean
@@ -77,24 +79,31 @@ $(BUILD)/wificontrol.exe: $(WOBJ) $(NOMANIFEST)
 	$(WINCC) $(WOBJ) -o $@ -B$(dir $(NOMANIFEST)) $(WLDFLAGS) $(WLIBS)
 	@echo "built $@ with -std=$(STD) ($$(stat -c %s $@ 2>/dev/null || stat -f %z $@) bytes)"
 
-test: $(TESTBIN) $(PERFTEST)
+test: $(TESTBIN) $(PERFTEST) $(DIAGTEST)
 	./$(TESTBIN)
 	./$(PERFTEST)
+	./$(DIAGTEST)
 
-$(TESTBIN): tests/test_core.c src/wlan_core.c src/wlan.h | $(BUILD)
-	$(CC) $(TESTFLAGS) tests/test_core.c src/wlan_core.c -o $@
+$(TESTBIN): tests/test_core.c src/wlan_core.c src/diag.c src/wlan.h src/diag.h | $(BUILD)
+	$(CC) $(TESTFLAGS) tests/test_core.c src/wlan_core.c src/diag.c -o $@
 
-$(PERFTEST): tests/test_perf.c src/perf.c src/perf.h src/wlan.h | $(BUILD)
-	$(CC) $(TESTFLAGS) tests/test_perf.c src/perf.c -o $@
+$(PERFTEST): tests/test_perf.c src/perf.c src/diag.c src/perf.h src/wlan.h | $(BUILD)
+	$(CC) $(TESTFLAGS) tests/test_perf.c src/perf.c src/diag.c -o $@
+
+$(DIAGTEST): tests/test_diag.c src/diag.c src/diag.h | $(BUILD)
+	$(CC) $(TESTFLAGS) tests/test_diag.c src/diag.c -o $@
 
 clean:
 	rm -rf $(BUILD)
 
-$(BUILD)/app.o:        src/app.h src/perf.h src/perf_win32.h src/ui.h src/wlan.h src/wlan_win32.h
+$(BUILD)/app.o:        src/app.h src/perf.h src/perf_win32.h src/tune.h src/ui.h src/wlan.h \
+                       src/wlan_win32.h src/diag.h
 $(BUILD)/app_ui.o:     src/app.h src/ui.h src/tune.h src/wlan.h src/wlan_win32.h src/resource.h
 $(BUILD)/ui_draw.o:    src/ui.h
 $(BUILD)/ui_ctl.o:     src/ui.h
-$(BUILD)/wlan_core.o:  src/wlan.h
+$(BUILD)/wlan_core.o:  src/wlan.h src/diag.h
+$(BUILD)/diag.o:       src/diag.h
+$(BUILD)/diag_ui.o:    src/app.h src/diag.h src/ui.h src/wlan.h src/wlan_win32.h src/resource.h
 $(BUILD)/wlan_win32.o: src/wlan.h src/wlan_win32.h
 $(BUILD)/tune.o:        src/tune.h src/wlan.h
 $(BUILD)/tune_driver.o: src/tune.h src/wlan.h src/wlan_win32.h

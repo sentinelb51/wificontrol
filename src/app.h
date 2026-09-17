@@ -24,6 +24,7 @@
 #define WM_W_PLAN      (WM_APP + 17) /* the active power plan changed */
 #define WM_W_PERF_END  (WM_APP + 18) /* session ending: put everything back, no restart */
 #define WM_W_STREAMING (WM_APP + 19) /* wp: the Streaming mode switch */
+#define WM_W_RECHECK   (WM_APP + 20) /* Refresh: probe what is available again, then poll */
 
 typedef struct {
     wc_guid       guid;
@@ -39,10 +40,11 @@ typedef struct {
     int           n;
     bool          bgscan_off, streaming_on, nuclear, metered, write_denied;
     bool          perf, perf_busy;   /* the switch; an adapter is restarting */
-    unsigned long perf_err;
     int           recovered;
     unsigned long enum_err, open_err;
     unsigned      seq;           /* the newest switch change it reflects */
+    wc_cap_state  cap[WC_CAP_COUNT]; /* what this machine can do; from the last check */
+    diag_log      diag;              /* what has failed since the last check */
     snap_row      row[WC_MAX_ADAPTERS];
 } snapshot;
 
@@ -59,6 +61,12 @@ void  cfg_save_metered(bool on);
 void  cfg_save_perf(bool on);
 void  cfg_save_dark(bool on);
 HICON make_icon(int size, COLORREF c, double fill); /* fill: the glyph's share of the icon */
+
+/* The details window: everything the status line has no room for -- what is
+ * unavailable and why, and every failure since the last check, each with the
+ * setting it happened on and what to do about it.  `headline` is the one line
+ * that brought the user here, or nullptr when they asked for it themselves. */
+void  diag_dialog(HWND parent, const snapshot *s, const wchar_t *headline);
 
 /* Created hidden.  ui_set_theme() must already have run. */
 HWND  main_window_create(HINSTANCE inst);

@@ -30,7 +30,10 @@ typedef struct {
     unsigned long cost[4][8];           /* each profile's cost and its source */
     int           csrc[4][8];
     unsigned long c_err;                /* fails every cost read */
+    unsigned long m_err;                /* fails every cost write */
+    unsigned long e_err;                /* fails the enumeration */
     int           ncq, ncs;             /* cost reads and writes */
+    diag_log      log;                  /* what the core reported, in order */
 } fake;
 
 static int fake_index(const fake *f, const wc_guid *g)
@@ -43,6 +46,7 @@ static int fake_index(const fake *f, const wc_guid *g)
 static unsigned long f_enum(void *ctx, wc_ifinfo *out, int cap, int *count)
 {
     fake *f = ctx;
+    if (f->e_err) { *count = 0; return f->e_err; }
     int n = f->n < cap ? f->n : cap;
     memcpy(out, f->ifs, (size_t)n * sizeof *out);
     *count = n;
@@ -104,6 +108,7 @@ static unsigned long f_setmet(void *ctx, const wc_guid *g, const char *p, int me
 {
     fake *f = ctx;
     f->ncs++;
+    if (f->m_err) return f->m_err;
     int i = fake_index(f, g);
     if (i < 0) return WC_E_BADDATA;
     f->cost[i][atoi(p)] = metered ? WC_COST_VARIABLE : COST_UNRESTRICTED;
@@ -129,6 +134,20 @@ static void fake_init(fake *f, int nifs)
     }
 }
 
+/* The app shows these; here they are just recorded, as the app's log would. */
+static void f_note(void *ctx, diag_op op, diag_step step, const char *subject,
+                   unsigned long code)
+{
+    diag_note(&((fake *)ctx)->log, op, step, subject, code, 1);
+}
+
+static const diag_entry *reported(fake *f, diag_op op, diag_step step)
+{
+    for (int i = 0; i < f->log.n; ++i)
+        if (f->log.e[i].op == op && f->log.e[i].step == step) return &f->log.e[i];
+    return nullptr;
+}
+
 static void bind(wc_state *s, fake *f)
 {
     wc_backend be = { .ctx = f, .enum_ifaces = f_enum, .query_bool = f_query,
@@ -136,6 +155,7 @@ static void bind(wc_state *s, fake *f)
                       .list_profiles = f_profiles, .query_cost = f_qcost,
                       .set_metered = f_setmet };
     wc_init(s, &be);
+    wc_set_note(s, f_note, f);
 }
 
 /* ----------------------------------------------------------------- cases */
@@ -555,6 +575,81 @@ static void t_metered_read_errors_quiet_when_off(void)
     CHECK(s.ad[0].last_err == 50);
 }
 
+static void t_a_refused_write_names_the_switch_and_the_adapter(void)
+{
+    printf("a refused write says which switch, which adapter and why\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.s_err = WC_E_ACCESS_DENIED;
+
+    wc_poll(&s);
+    const diag_entry *e = reported(&f, DIAG_STREAMING, DIAG_WRITE);
+    CHECK(e && e->code == WC_E_ACCESS_DENIED && !strcmp(e->subject, "Adapter 0"));
+    CHECK(reported(&f, DIAG_BGSCAN, DIAG_WRITE) != nullptr);
+    /* Repeated passes are the same failure, not a growing pile of them. */
+    const int was = f.log.n;
+    wc_poll(&s);
+    CHECK(f.log.n == was);
+}
+
+static void t_a_cost_that_will_not_move_names_the_network(void)
+{
+    printf("a network whose cost will not move is named, one entry each\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.nprof[0] = 2;
+
+    wc_poll(&s);
+    f.m_err = WC_E_NETSH;
+    wc_set_metered(&s, true);
+    CHECK(diag_count(&f.log, DIAG_WARN) == 2);   /* the fake names profiles "0" and "1" */
+    const diag_entry *e = reported(&f, DIAG_METERED, DIAG_WRITE);
+    CHECK(e && e->code == WC_E_NETSH);
+    CHECK(e && (!strcmp(e->subject, "0") || !strcmp(e->subject, "1")));
+}
+
+static void t_failing_to_give_scanning_back_is_serious(void)
+{
+    printf("failing to give auto configuration back is reported as serious\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+
+    wc_poll(&s);
+    wc_set_nuclear(&s, true);
+    CHECK(s.ad[0].autoconf == WC_VAL_OFF);
+
+    /* Disarm with the writes refused: scanning stays off, which is the one
+     * failure that outlives the process. */
+    f.s_err = WC_E_ACCESS_DENIED;
+    wc_set_nuclear(&s, false);
+    const diag_entry *e = reported(&f, DIAG_AUTOCONF, DIAG_RESTORE);
+    CHECK(e && diag_sev_of(e->op, e->code) == DIAG_ERR);
+}
+
+static void t_a_disconnect_race_is_not_an_alarm(void)
+{
+    printf("losing a race with a disconnect is noted, but not as a problem\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.s_err = WC_E_INVALID_STATE;
+
+    wc_poll(&s);
+    CHECK(f.log.n > 0);
+    CHECK(diag_count(&f.log, DIAG_WARN) == 0);
+}
+
+static void t_an_enumeration_failure_is_reported(void)
+{
+    printf("an adapter list that cannot be read is reported as fatal\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.e_err = WC_E_ACCESS_DENIED;
+
+    CHECK(wc_poll(&s) == WC_E_ACCESS_DENIED);
+    const diag_entry *e = reported(&f, DIAG_ADAPTERS, DIAG_READ);
+    CHECK(e && diag_sev_of(e->op, e->code) == DIAG_ERR);
+
+    /* A machine with no Wi-Fi at all is not a failure. */
+    fake g; wc_state t; fake_init(&g, 0); bind(&t, &g);
+    wc_poll(&t);
+    CHECK(g.log.n == 0);
+}
+
 int main(void)
 {
     t_applies_and_is_idempotent();
@@ -580,6 +675,11 @@ int main(void)
     t_metered_repairs_only_its_own_cost();
     t_metered_released_by_every_switch();
     t_metered_read_errors_quiet_when_off();
+    t_a_refused_write_names_the_switch_and_the_adapter();
+    t_a_cost_that_will_not_move_names_the_network();
+    t_failing_to_give_scanning_back_is_serious();
+    t_a_disconnect_race_is_not_an_alarm();
+    t_an_enumeration_failure_is_reported();
 
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall checks passed\n");

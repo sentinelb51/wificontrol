@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "app.h"
 #include "perf_win32.h"
+#include "tune.h"
 #include "ui.h"
 
 #include <commctrl.h>
@@ -237,8 +238,74 @@ static perf_backend g_perf_be;
 static unsigned long (*g_perf_restart)(void *ctx, const wc_guid *adapter);
 static bool         g_perf;      /* the switch, as last sent by the window */
 static bool         g_perf_busy;
-static perf_result  g_perf_res;
 static unsigned     g_seq;       /* the window's newest switch change handled */
+
+/* Everything that has failed since the last check, and what this machine can
+ * do at all.  Both are the worker's, and the window gets a copy of each with
+ * every snapshot -- so there is still nothing to lock. */
+static diag_log     g_diag;
+static wc_cap_state g_cap[WC_CAP_COUNT];
+
+static void note_core([[maybe_unused]] void *ctx, diag_op op, diag_step step,
+                      const char *subject, unsigned long code)
+{
+    diag_note(&g_diag, op, step, subject, code, GetTickCount());
+}
+
+/* The Performance switch reports a setting and the adapter or plan it sits on;
+ * the window shows those in words, never a GUID. */
+static void note_perf([[maybe_unused]] void *ctx, diag_op op, diag_step step,
+                      const wc_guid *owner, const char *name, unsigned long code)
+{
+    char subject[DIAG_SUBJ_MAX] = "";
+    const char *label = name ? perf_label(name) : nullptr;
+    const int i = owner ? wc_find(&g_core, owner) : -1;
+
+    if (label && i >= 0) snprintf(subject, sizeof subject, "%s on %s", label, g_core.ad[i].name);
+    else if (label)      snprintf(subject, sizeof subject, "%s", label);
+    else if (i >= 0)     snprintf(subject, sizeof subject, "%s", g_core.ad[i].name);
+    diag_note(&g_diag, op, step, subject, code, GetTickCount());
+}
+
+static void cap_set(wc_cap c, unsigned long err)
+{
+    g_cap[c] = (wc_cap_state){ .ok = (err == WC_OK), .checked = true, .err = err };
+}
+
+/* What can be done on this machine at all, so a switch whose service is not
+ * here is greyed out with a reason instead of failing when it is flipped.
+ * Runs at startup and on every Refresh, never on the poll: each check costs a
+ * registry walk or a file open. */
+static void worker_probe_caps(void)
+{
+    cap_set(WC_CAP_WLAN, g_open_err);
+
+    /* The three opcodes: only meaningful once there is a handle to ask about,
+     * and advisory even then -- see wc_probe_access. */
+    if (g_open_err == WC_OK) {
+        static const wc_cap by_opt[WC_OPT_COUNT] = {
+            [WC_OPT_STREAMING] = WC_CAP_STREAMING,
+            [WC_OPT_BGSCAN]    = WC_CAP_BGSCAN,
+            [WC_OPT_AUTOCONF]  = WC_CAP_AUTOCONF,
+        };
+        for (int o = 0; o < WC_OPT_COUNT; ++o)
+            cap_set(by_opt[o], g_core.can_write[o] ? WC_OK : WC_E_ACCESS_DENIED);
+    }
+
+    cap_set(WC_CAP_COST, wcw_cost_available());
+    cap_set(WC_CAP_JOURNAL, perf_win32_journal_check(g_journal_path));
+    cap_set(WC_CAP_POWER, perf_win32_power_check());
+
+    /* One present adapter with a writable driver key is enough; with no
+     * adapter at all there is nothing to say yet. */
+    unsigned long driver = ERROR_FILE_NOT_FOUND;
+    for (int i = 0; i < g_core.n; ++i) {
+        if (!g_core.ad[i].present) continue;
+        driver = tune_driver_check(&g_core.ad[i].guid);
+        if (driver == WC_OK) break;
+    }
+    cap_set(WC_CAP_DRIVER, driver);
+}
 
 static void worker_send_snapshot(void)
 {
@@ -252,12 +319,13 @@ static void worker_send_snapshot(void)
     s->metered    = g_core.metered;
     s->perf       = g_perf;
     s->perf_busy  = g_perf_busy;
-    s->perf_err   = g_perf_res.err;
     s->recovered  = g_core.recovered;
     s->write_denied = wc_write_denied(&g_core);
     s->enum_err   = g_core.enum_err;
     s->open_err   = g_open_err;
     s->seq        = g_seq;
+    s->diag       = g_diag;
+    memcpy(s->cap, g_cap, sizeof s->cap);
 
     for (int i = 0; i < g_core.n; ++i) {
         const wc_adapter *a = &g_core.ad[i];
@@ -293,12 +361,23 @@ static unsigned long worker_restart(void *ctx, const wc_guid *adapter)
  * transitions only, never from the poll. */
 static void worker_perf(bool restart)
 {
+    /* Nothing is held without somewhere to record what it was.  Whatever was
+     * recorded by an earlier run is still put back, which is the one thing
+     * left worth doing. */
+    if (g_perf && !wc_cap_ok(g_cap, WC_CAP_JOURNAL)) {
+        diag_note(&g_diag, DIAG_PERF_JOURNAL, DIAG_RECORD, nullptr, WC_E_NO_JOURNAL,
+                  GetTickCount());
+        g_perf = false;
+    }
+
     perf_adapter ad[WC_MAX_ADAPTERS];
     for (int i = 0; i < g_core.n; ++i) {
         const wc_adapter *a = &g_core.ad[i];
         ad[i] = (perf_adapter){ a->guid, g_perf && a->managed && a->present, a->present };
     }
-    g_perf_res = perf_sync(&g_perf_be, g_perf, ad, g_core.n, restart);
+    /* The counts it returns are shown nowhere: what the window needs from a
+     * pass is the log the note sink fills as it goes. */
+    (void)perf_sync(&g_perf_be, g_perf, ad, g_core.n, restart);
 }
 
 static void worker_poll(void)
@@ -325,6 +404,44 @@ static void CALLBACK acm_callback([[maybe_unused]] PWLAN_NOTIFICATION_DATA data,
     /* Runs on a wlanapi thread: post and return, never call back into the API
      * and never block. */
     if (g_worker) PostMessageW(g_worker, WM_W_POLL, 0, 0);
+}
+
+/* Open the client handle and bring the core up on it: the saved switches
+ * first, then the first apply pass, then the notifications.  Called again by
+ * Refresh, so a service that was not running at startup is picked up without
+ * restarting the app. */
+static void worker_start_wlan(void)
+{
+    if (g_win32.h) return;
+
+    wc_backend be;
+    memset(&be, 0, sizeof be);
+    g_open_err = wcw_open(&g_win32, &be);
+    if (g_open_err != WC_OK) return;
+
+    /* Whatever the switches are set to now: on a retry the user may have
+     * moved them while the service was away. */
+    const bool bgscan = g_core.bgscan_off, streaming = g_core.streaming_on,
+               metered = g_core.metered;
+    wc_init(&g_core, &be);
+    wc_set_note(&g_core, note_core, nullptr);
+    wc_probe_access(&g_core);
+
+    /* Enumerate and apply the saved choices *before* the first apply pass,
+     * so an adapter the user unchecked is never briefly optimised. */
+    wc_refresh(&g_core);
+    g_core.bgscan_off   = bgscan;
+    g_core.streaming_on = streaming;
+    g_core.metered      = metered;
+    for (int i = 0; i < g_boot_cfg.n; ++i) {
+        int j = wc_find(&g_core, &g_boot_cfg.e[i].g);
+        if (j >= 0) g_core.ad[j].managed = g_boot_cfg.e[i].managed;
+    }
+    wc_apply_all(&g_core);
+    g_last_poll = GetTickCount();
+
+    wcw_register(&g_win32, acm_callback, NULL);
+    SetTimer(g_worker, T_WATCHDOG, WATCHDOG_MS, NULL);
 }
 
 static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -359,21 +476,18 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         worker_send_snapshot();
         return 0;
 
-    case WM_W_PLAN: {
+    case WM_W_PLAN:
         /* Another plan is active: hold it instead, and give the old one back. */
-        perf_result r = perf_sync_power(&g_perf_be, g_perf);
-        g_perf_res.held = r.held;
-        if (r.err) g_perf_res.err = r.err;
+        (void)perf_sync_power(&g_perf_be, g_perf);
         worker_send_snapshot();
         return 0;
-    }
 
     case WM_W_PERF_END:
         /* The reboot applies the driver values, so no restart; the next start
          * holds them again from the saved switch.  Off in memory only, so a
          * late plan change cannot hold anything again on the way down. */
         g_perf = false;
-        g_perf_res = perf_sync(&g_perf_be, false, nullptr, 0, false);
+        (void)perf_sync(&g_perf_be, false, nullptr, 0, false);
         return 0;
 
     case WM_W_NUCLEAR:
@@ -381,10 +495,28 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         worker_send_snapshot();
         return 0;
 
-    case WM_W_METERED:
+    case WM_W_METERED: {
         g_seq = (unsigned)lp;
-        wc_set_metered(&g_core, (int)wp);
+        /* A cost cannot be written on this machine at all: say so rather than
+         * showing the switch on while every network is left alone. */
+        const bool on = wp != 0 && wc_cap_ok(g_cap, WC_CAP_COST);
+        if (wp && !on)
+            diag_note(&g_diag, DIAG_METERED, DIAG_WRITE, nullptr, g_cap[WC_CAP_COST].err,
+                      GetTickCount());
+        wc_set_metered(&g_core, on);
         worker_send_snapshot();
+        return 0;
+    }
+
+    /* Refresh: everything is looked at again, including what is available,
+     * and the failure log starts over so it describes this check and not one
+     * from ten minutes ago. */
+    case WM_W_RECHECK:
+        diag_clear(&g_diag);
+        worker_start_wlan();
+        if (g_win32.h) wc_probe_access(&g_core);
+        worker_probe_caps();
+        worker_poll();
         return 0;
 
     case WM_W_MANAGE: {
@@ -438,36 +570,31 @@ static unsigned __stdcall worker_main([[maybe_unused]] void *param)
                                HWND_MESSAGE, NULL, wc.hInstance, NULL);
     if (!g_worker) { SetEvent(g_worker_ready); return 1; }
 
-    wc_backend be;
-    memset(&be, 0, sizeof be);
-    g_open_err = wcw_open(&g_win32, &be);
-
-    if (g_open_err == WC_OK) {
-        wc_init(&g_core, &be);
-        wc_probe_access(&g_core);
-
-        /* Enumerate and apply the saved choices *before* the first apply pass,
-         * so an adapter the user unchecked is never briefly optimised. */
-        wc_refresh(&g_core);
-        g_core.bgscan_off   = g_boot_cfg.bgscan_off;
-        g_core.streaming_on = g_boot_cfg.streaming_on;
-        g_core.metered      = g_boot_cfg.metered;
-        for (int i = 0; i < g_boot_cfg.n; ++i) {
-            int j = wc_find(&g_core, &g_boot_cfg.e[i].g);
-            if (j >= 0) g_core.ad[j].managed = g_boot_cfg.e[i].managed;
-        }
-        wc_apply_all(&g_core);
-        g_last_poll = GetTickCount();
-
-        wcw_register(&g_win32, acm_callback, NULL);
-        SetTimer(g_worker, T_WATCHDOG, WATCHDOG_MS, NULL);
-    }
+    /* The core holds the saved switches whether or not a handle can be opened,
+     * so the window shows what is asked for rather than nothing, and a later
+     * Refresh applies it if the service turns up.  With no adapters it makes
+     * no backend calls. */
+    wc_backend none;
+    memset(&none, 0, sizeof none);
+    wc_init(&g_core, &none);
+    wc_set_note(&g_core, note_core, nullptr);
+    g_core.bgscan_off   = g_boot_cfg.bgscan_off;
+    g_core.streaming_on = g_boot_cfg.streaming_on;
+    /* Checked before the first apply pass rather than after it: a saved
+     * switch whose service is not here never comes on, so the pass does not
+     * spend itself failing on every saved network.  The window greys the
+     * switch out and the details window says why. */
+    cap_set(WC_CAP_COST, wcw_cost_available());
+    g_core.metered      = g_boot_cfg.metered && wc_cap_ok(g_cap, WC_CAP_COST);
 
     perf_win32_backend(&g_perf_be, g_journal_path);
     g_perf_restart = g_perf_be.restart;
     g_perf_be.restart = worker_restart;
+    g_perf_be.note    = note_perf;
     g_perf = g_boot_cfg.perf; /* so the first snapshot shows the saved switch */
 
+    worker_start_wlan();
+    worker_probe_caps();
     worker_send_snapshot();
 
     /* Hold the saved switch, or repair a run that was killed while holding.

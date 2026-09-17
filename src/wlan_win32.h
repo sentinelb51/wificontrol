@@ -31,6 +31,12 @@ void          wcw_unregister(wc_win32 *w);
  * therefore schedules one debounced, rate-limited poll; a poll that finds
  * nothing to change costs two WlanQueryInterface calls per adapter. */
 
+/* Whether a saved network's cost can be read and written at all on this
+ * machine: the WCM API, which Windows 7 does not have, and netsh, which is
+ * what writes it.  WC_OK, or the reason it cannot.  Safe to call before
+ * wcw_open. */
+unsigned long wcw_cost_available(void);
+
 void wcw_format_error(unsigned long code, wchar_t *buf, int cap);
 void wcw_guid_to_string(const wc_guid *g, wchar_t *buf, int cap);
 bool wcw_guid_from_string(const wchar_t *s, wc_guid *g);

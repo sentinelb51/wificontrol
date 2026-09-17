@@ -24,6 +24,27 @@ void wc_init(wc_state *s, const wc_backend *be)
     for (int o = 0; o < WC_OPT_COUNT; ++o) s->can_write[o] = true;
 }
 
+void wc_set_note(wc_state *s, wc_note_fn note, void *ctx)
+{
+    s->note     = note;
+    s->note_ctx = ctx;
+}
+
+/* Report a failure, with the setting and the adapter it happened on.  WC_OK is
+ * passed through so callers can hand over whatever the backend returned. */
+static void note(const wc_state *s, diag_op op, diag_step step, const char *subject,
+                 unsigned long e)
+{
+    if (e != WC_OK && s->note) s->note(s->note_ctx, op, step, subject, e);
+}
+
+static diag_op op_of(wc_opt o)
+{
+    return o == WC_OPT_STREAMING ? DIAG_STREAMING
+         : o == WC_OPT_BGSCAN    ? DIAG_BGSCAN
+                                 : DIAG_AUTOCONF;
+}
+
 void wc_probe_access(wc_state *s)
 {
     if (!s->be.granted_write) return;
@@ -53,9 +74,14 @@ unsigned long wc_refresh(wc_state *s)
     wc_ifinfo tmp[WC_MAX_ADAPTERS];
     int n = 0;
 
+    /* No backend yet: the app brings the core up before it has a handle, so
+     * that it can hold the saved switches until one opens. */
+    if (!s->be.enum_ifaces) return WC_E_BADDATA;
+
     unsigned long e = s->be.enum_ifaces(s->be.ctx, tmp, WC_MAX_ADAPTERS, &n);
     if (e != WC_OK) {
         s->enum_err = e;
+        note(s, DIAG_ADAPTERS, DIAG_READ, nullptr, e);
         for (int i = 0; i < s->n; ++i) s->ad[i].present = false;
         return e;
     }
@@ -94,10 +120,17 @@ unsigned long wc_refresh(wc_state *s)
 static void apply_opcode(wc_state *s, wc_adapter *a, wc_opt o, bool want, wc_val *slot)
 {
     const int desired = (o == WC_OPT_STREAMING) == want;
+    const diag_op   op   = op_of(o);
+    const diag_step step = want ? DIAG_WRITE : DIAG_RESTORE;
 
     int cur = 0;
     unsigned long e = s->be.query_bool(s->be.ctx, &a->guid, o, &cur);
-    if (e != WC_OK) { *slot = WC_VAL_UNKNOWN; if (!a->last_err) a->last_err = e; return; }
+    if (e != WC_OK) {
+        *slot = WC_VAL_UNKNOWN;
+        note(s, op, DIAG_READ, a->name, e);
+        if (!a->last_err) a->last_err = e;
+        return;
+    }
 
     cur   = !!cur;
     *slot = cur ? WC_VAL_ON : WC_VAL_OFF;
@@ -105,15 +138,27 @@ static void apply_opcode(wc_state *s, wc_adapter *a, wc_opt o, bool want, wc_val
     if (cur == desired) { a->voted[o] = want; return; }
 
     e = s->be.set_bool(s->be.ctx, &a->guid, o, desired);
-    if (e != WC_OK) { if (!a->last_err) a->last_err = e; return; }
+    if (e != WC_OK) {
+        note(s, op, step, a->name, e);
+        if (!a->last_err) a->last_err = e;
+        return;
+    }
     a->voted[o] = want;
 
     e = s->be.query_bool(s->be.ctx, &a->guid, o, &cur);
-    if (e != WC_OK) { *slot = WC_VAL_UNKNOWN; if (!a->last_err) a->last_err = e; return; }
+    if (e != WC_OK) {
+        *slot = WC_VAL_UNKNOWN;
+        note(s, op, DIAG_READ, a->name, e);
+        if (!a->last_err) a->last_err = e;
+        return;
+    }
 
     cur   = !!cur;
     *slot = cur ? WC_VAL_ON : WC_VAL_OFF;
-    if (want && cur != desired && !a->last_err) a->last_err = WC_E_VERIFY;
+    if (want && cur != desired) {
+        note(s, op, step, a->name, WC_E_VERIFY);
+        if (!a->last_err) a->last_err = WC_E_VERIFY;
+    }
 }
 
 /* Auto config is forced back on unless every condition for keeping it off
@@ -130,7 +175,12 @@ static void apply_autoconf(wc_state *s, wc_adapter *a)
 
     int cur = 0;
     unsigned long e = s->be.query_bool(s->be.ctx, &a->guid, WC_OPT_AUTOCONF, &cur);
-    if (e != WC_OK) { a->autoconf = WC_VAL_UNKNOWN; if (!a->last_err) a->last_err = e; return; }
+    if (e != WC_OK) {
+        a->autoconf = WC_VAL_UNKNOWN;
+        note(s, DIAG_AUTOCONF, DIAG_READ, a->name, e);
+        if (!a->last_err) a->last_err = e;
+        return;
+    }
 
     cur = !!cur;
     a->autoconf = cur ? WC_VAL_ON : WC_VAL_OFF;
@@ -139,7 +189,13 @@ static void apply_autoconf(wc_state *s, wc_adapter *a)
     if (cur == desired) return;
 
     e = s->be.set_bool(s->be.ctx, &a->guid, WC_OPT_AUTOCONF, desired);
-    if (e != WC_OK) { if (!a->last_err) a->last_err = e; return; }
+    if (e != WC_OK) {
+        /* Failing to give scanning back is the worst of the three: it is the
+         * one setting that outlives the process. */
+        note(s, DIAG_AUTOCONF, desired ? DIAG_RESTORE : DIAG_WRITE, a->name, e);
+        if (!a->last_err) a->last_err = e;
+        return;
+    }
 
     a->autoconf = desired ? WC_VAL_ON : WC_VAL_OFF;
     /* Count only repairs, so the UI can say it cleaned up after something. */
@@ -162,7 +218,11 @@ static void apply_metered(wc_state *s, wc_adapter *a)
     static wc_profile prof[WC_MAX_PROFILES];
     int n = 0;
     unsigned long e = s->be.list_profiles(s->be.ctx, &a->guid, prof, WC_MAX_PROFILES, &n);
-    if (e != WC_OK) { if (want && !a->last_err) a->last_err = e; return; }
+    if (e != WC_OK) {
+        note(s, DIAG_PROFILES, DIAG_READ, a->name, e);
+        if (want && !a->last_err) a->last_err = e;
+        return;
+    }
 
     int ours = 0;
     bool clean = true;
@@ -173,13 +233,22 @@ static void apply_metered(wc_state *s, wc_adapter *a)
         unsigned long cost = 0;
         int src = 0;
         e = s->be.query_cost(s->be.ctx, &a->guid, prof[k].name, &cost, &src);
-        if (e != WC_OK) { clean = false; if (want && !a->last_err) a->last_err = e; continue; }
+        if (e != WC_OK) {
+            note(s, DIAG_METERED, DIAG_READ, prof[k].name, e);
+            clean = false;
+            if (want && !a->last_err) a->last_err = e;
+            continue;
+        }
 
         bool is_ours = (cost & WC_COST_VARIABLE) && src == WC_COST_SRC_USER;
         if (is_ours != want) {
             e = s->be.set_metered(s->be.ctx, &a->guid, prof[k].name, want);
             if (e == WC_OK) is_ours = want;
-            else { clean = false; if (!a->last_err) a->last_err = e; }
+            else {
+                note(s, DIAG_METERED, want ? DIAG_WRITE : DIAG_RESTORE, prof[k].name, e);
+                clean = false;
+                if (!a->last_err) a->last_err = e;
+            }
         }
         if (is_ours) ours++;
     }
@@ -307,15 +376,5 @@ const char *wc_state_name(wc_ifstate st)
     case WC_IF_DISCOVERING:    return "Discovering";
     case WC_IF_AUTHENTICATING: return "Authenticating";
     default:                   return "Unknown";
-    }
-}
-
-const char *wc_strerror(unsigned long code)
-{
-    switch (code) {
-    case WC_E_VERIFY:  return "setting did not stick (driver rejected it)";
-    case WC_E_BADDATA: return "driver returned an unexpected value";
-    case WC_E_NETSH:   return "netsh refused to change a network's cost";
-    default:           return (code >= WC_E_APP) ? "unknown internal error" : nullptr;
     }
 }

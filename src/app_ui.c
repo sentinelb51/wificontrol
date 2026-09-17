@@ -29,14 +29,20 @@
 #define ICON_FILL_TITLE 0.66
 
 /* The switches, top to bottom: a label, the switch, then a hint.  The row
- * without a hint has the timer dropdown in its place. */
-typedef struct { int id; const wchar_t *label, *hint; } switch_row;
+ * without a hint has the timer dropdown in its place.  Each also names what it
+ * needs, so a switch whose service is missing is greyed out with the reason in
+ * place of its hint rather than failing when it is flipped. */
+typedef struct { int id; wc_switch sw; const wchar_t *label, *hint; } switch_row;
 static const switch_row SWITCHES[] = {
-    { IDC_BGSCAN,  L"No background scans", L"Stops the once-a-minute search for other networks" },
-    { IDC_STREAM,  L"Streaming mode",      L"Tells the driver latency matters more than power" },
-    { IDC_NUKE,    L"Block all scans",     nullptr },
-    { IDC_METERED, L"Metered",             L"Windows holds back updates and background sync" },
-    { IDC_PERF,    L"Performance",         L"No power saving or Wi-Fi Direct; restarts the adapter" },
+    { IDC_BGSCAN,  WC_SW_BGSCAN,    L"No background scans",
+      L"Stops the once-a-minute search for other networks" },
+    { IDC_STREAM,  WC_SW_STREAMING, L"Streaming mode",
+      L"Tells the driver latency matters more than power" },
+    { IDC_NUKE,    WC_SW_NUCLEAR,   L"Block all scans",     nullptr },
+    { IDC_METERED, WC_SW_METERED,   L"Metered",
+      L"Windows holds back updates and background sync" },
+    { IDC_PERF,    WC_SW_PERF,      L"Performance",
+      L"No power saving or Wi-Fi Direct; restarts the adapter" },
 };
 enum { N_SWITCHES = sizeof SWITCHES / sizeof SWITCHES[0] };
 
@@ -68,6 +74,17 @@ static int       g_manage_n;
 static wchar_t   g_status[512];
 static enum { SEV_INFO, SEV_WARN, SEV_ERR } g_status_sev;
 static unsigned  g_seq;              /* switch changes posted to the worker */
+static wchar_t   g_why[N_SWITCHES][320]; /* why a switch is greyed out, or empty */
+
+/* A switch the user has just flipped, and the moment they flipped it: when the
+ * worker comes back having failed at it, the details window opens by itself.
+ * Anything that fails on a poll is left to the status line and Details, since
+ * nobody asked for it just then. */
+static int       g_report_sw = -1;
+static bool      g_report_on;
+static bool      g_modal;            /* a window of ours is already modal here */
+static unsigned  g_report_seq;
+static unsigned long g_report_at;
 
 /* Never written to the config file.  The app always starts disarmed, which is
  * what makes the first poll repair a previous run that was killed while armed:
@@ -101,8 +118,11 @@ static bool opcode_held(const snapshot *s, const snap_row *r)
 static COLORREF state_color(const snapshot *s)
 {
     if (!s || s->open_err || s->enum_err) return RGB(200, 60, 60);
+    const diag_sev worst = diag_worst(&s->diag);
+    if (worst == DIAG_ERR)                return RGB(200, 60, 60);
     if (s->write_denied)                  return RGB(214, 152, 32);
     if (s->nuclear)                       return RGB(198, 86, 26); /* armed: unmistakable */
+    if (worst == DIAG_WARN)               return RGB(214, 152, 32);
     for (int i = 0; i < s->n; ++i)
         if (s->row[i].present && s->row[i].last_err) return RGB(214, 152, 32);
     for (int i = 0; i < s->n; ++i)
@@ -170,17 +190,31 @@ static void tray_balloon(HWND hwnd, const wchar_t *title, const wchar_t *text)
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+/* Whether that switch is greyed out, as the last snapshot left it. */
+static bool sw_blocked(wc_switch sw)
+{
+    for (int k = 0; k < N_SWITCHES; ++k)
+        if (SWITCHES[k].sw == sw) return g_why[k][0] != L'\0';
+    return false;
+}
+
+/* The state of a switch, and whether the menu can offer it at all. */
+static UINT menu_flags(HWND hwnd, int id, wc_switch sw)
+{
+    return MF_STRING | (ui_switch_get(GetDlgItem(hwnd, id)) ? MF_CHECKED : 0)
+                     | (sw_blocked(sw) ? MF_GRAYED : 0);
+}
+
 static void tray_menu(HWND hwnd)
 {
     HMENU m = CreatePopupMenu();
     if (!m) return;
     AppendMenuW(m, MF_STRING, IDM_SHOW, L"&Show WiFi Control");
-    AppendMenuW(m, MF_STRING | (ui_switch_get(GetDlgItem(hwnd, IDC_BGSCAN)) ? MF_CHECKED : 0),
-                IDM_BGSCAN, L"No &background scans");
-    AppendMenuW(m, MF_STRING | (ui_switch_get(GetDlgItem(hwnd, IDC_STREAM)) ? MF_CHECKED : 0),
-                IDM_STREAM, L"Streaming &mode");
-    AppendMenuW(m, MF_STRING | (ui_switch_get(GetDlgItem(hwnd, IDC_PERF)) ? MF_CHECKED : 0),
-                IDM_PERF, L"&Performance");
+    AppendMenuW(m, menu_flags(hwnd, IDC_BGSCAN, WC_SW_BGSCAN), IDM_BGSCAN,
+                L"No &background scans");
+    AppendMenuW(m, menu_flags(hwnd, IDC_STREAM, WC_SW_STREAMING), IDM_STREAM,
+                L"Streaming &mode");
+    AppendMenuW(m, menu_flags(hwnd, IDC_PERF, WC_SW_PERF), IDM_PERF, L"&Performance");
     AppendMenuW(m, MF_STRING | (ui_dark ? MF_CHECKED : 0), IDM_DARK, L"&Dark theme");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"E&xit");
@@ -328,9 +362,15 @@ static void paint_main(HWND hwnd)
         ui_fill(&c, 0, 0, c.w, c.h, ui_pal.bg);
         for (int k = 0; k < N_SWITCHES; ++k) {
             const int y = ROW_TOP(k);
-            ui_text(&c, g_f.body, ui_pal.text, SWITCHES[k].label,
+            const bool blocked = g_why[k][0] != L'\0';
+            ui_text(&c, g_f.body, blocked ? ui_pal.text2 : ui_pal.text, SWITCHES[k].label,
                     P(PAD), y, P(SWITCH_X - 8), y + P(ROW_H), one);
-            if (SWITCHES[k].hint)
+            /* The reason takes the hint's place: a dead switch with no
+             * explanation beside it is the thing to avoid. */
+            if (blocked)
+                ui_text(&c, g_f.small, ui_pal.warn, g_why[k],
+                        P(HINT_X), y, c.w - P(PAD), y + P(ROW_H), one);
+            else if (SWITCHES[k].hint)
                 ui_text(&c, g_f.small, ui_pal.text2, SWITCHES[k].hint,
                         P(HINT_X), y, c.w - P(PAD), y + P(ROW_H), one);
         }
@@ -364,15 +404,29 @@ static void update_status(HWND hwnd)
         g_status_sev = SEV_ERR;
     } else if (g_snap->write_denied) {
         wcscpy(text, L"Windows is refusing these settings even with administrator rights. "
-                     L"A group policy or a Native Wifi permission change is blocking them.");
+                     L"A group policy or a Native Wifi permission change is blocking them. "
+                     L"Details says which ones.");
         g_status_sev = SEV_WARN;
     } else if (g_snap->perf_busy) {
         wcscpy(text, L"Restarting the Wi-Fi adapter so its power settings take effect. "
                      L"The connection is back in a few seconds.");
-    } else if (g_snap->perf_err) {
-        wcw_format_error(g_snap->perf_err, err, 256);
-        _snwprintf(text, 512, L"Could not change a power setting: %s", err);
-        g_status_sev = SEV_WARN;
+    } else if (diag_count(&g_snap->diag, DIAG_WARN) > 0) {
+        /* One line for the worst of it; the rest is a click away. */
+        const diag_entry *e = diag_worst_entry(&g_snap->diag);
+        const int n = diag_count(&g_snap->diag, DIAG_WARN);
+        wchar_t what[128], subject[DIAG_SUBJ_MAX];
+        MultiByteToWideChar(CP_UTF8, 0, diag_op_name(e->op), -1, what, 128);
+        MultiByteToWideChar(CP_UTF8, 0, e->subject, -1, subject, DIAG_SUBJ_MAX);
+        wcw_format_error(e->code, err, 256);
+        if (n > 1)
+            _snwprintf(text, 512, L"%d problems since the last check. %s: %s. Details has "
+                                  L"all of them and what to do about them.", n, what, err);
+        else if (subject[0])
+            _snwprintf(text, 512, L"%s (%s): %s. Details says what to do about it.",
+                       what, subject, err);
+        else
+            _snwprintf(text, 512, L"%s: %s. Details says what to do about it.", what, err);
+        g_status_sev = diag_worst(&g_snap->diag) == DIAG_ERR ? SEV_ERR : SEV_WARN;
     } else {
         const snapshot *s = g_snap;
         int active = 0, waiting = 0, blocked = 0;
@@ -432,6 +486,95 @@ static void update_status(HWND hwnd)
 
 /* ------------------------------------------------------------- switches */
 
+/* Grey out every switch whose service is not on this machine, and keep the
+ * sentence that says why for the row to paint.  Run on every snapshot, so a
+ * Refresh that finds the WLAN service back brings them all to life. */
+static void sync_availability(HWND hwnd)
+{
+    for (int k = 0; k < N_SWITCHES; ++k) {
+        const char *why = g_snap ? wc_switch_blocked(g_snap->cap, SWITCHES[k].sw) : nullptr;
+        wchar_t was[320];
+        wcscpy(was, g_why[k]);
+        if (!why) g_why[k][0] = L'\0';
+        /* A reason that would not fit must still leave the switch dead: an
+         * empty one reads as "nothing wrong with this switch". */
+        else if (!MultiByteToWideChar(CP_UTF8, 0, why, -1, g_why[k], 320))
+            wcscpy(g_why[k], L"Not available on this machine.");
+        g_why[k][319] = L'\0';
+
+        EnableWindow(GetDlgItem(hwnd, SWITCHES[k].id), why == nullptr);
+        if (wcscmp(was, g_why[k]) != 0) {
+            RECT r = { 0, ROW_TOP(k), P(CLIENT_W), ROW_TOP(k) + P(ROW_H) };
+            InvalidateRect(hwnd, &r, FALSE);
+        }
+        /* The timer belongs to Block all scans: dead with it, and locked while
+         * it is armed. */
+        if (SWITCHES[k].sw == WC_SW_NUCLEAR)
+            EnableWindow(GetDlgItem(hwnd, IDC_NUKE_FOR),
+                         !why && !(g_snap && g_snap->nuclear));
+    }
+
+    /* Details carries the count, so the number of problems is visible without
+     * reading the status line. */
+    const int n = g_snap ? diag_count(&g_snap->diag, DIAG_WARN) : 0;
+    wchar_t label[32];
+    if (n > 0) _snwprintf(label, 32, L"Details (%d)", n);
+    else       wcscpy(label, L"Details");
+    HWND details = GetDlgItem(hwnd, IDC_DETAILS);
+    wchar_t now[32] = L"";
+    if (details) GetWindowTextW(details, now, 32);
+    if (details && wcscmp(now, label) != 0) {
+        SetWindowTextW(details, label);
+        InvalidateRect(details, nullptr, FALSE);
+    }
+}
+
+/* The one line that says what just went wrong, for the window that opens by
+ * itself after a switch the user flipped could not be applied. */
+static void report_headline(int sw, bool on, wchar_t *out, int cap)
+{
+    const wchar_t *text;
+    switch (sw) {
+    case WC_SW_BGSCAN:
+        text = on ? L"Background scanning could not be turned off everywhere."
+                  : L"Background scanning could not be handed back everywhere.";
+        break;
+    case WC_SW_STREAMING:
+        text = on ? L"Streaming mode could not be set everywhere."
+                  : L"Streaming mode could not be handed back everywhere.";
+        break;
+    case WC_SW_NUCLEAR:
+        text = on ? L"Scanning could not be blocked everywhere."
+                  : L"Scanning could not be given back everywhere. Anything still blocked "
+                    L"is retried every minute, and when this app exits.";
+        break;
+    case WC_SW_METERED:
+        text = on ? L"Not all of your saved networks could be marked as metered."
+                  : L"Not all of your saved networks could be handed back to the Windows "
+                    L"default.";
+        break;
+    default:
+        text = on ? L"Performance was not applied in full: some of the settings below "
+                    L"would not move."
+                  : L"Not everything Performance changed could be put back. What is left "
+                    L"is recorded, and is tried again when you switch it on and off, or "
+                    L"the next time the app starts.";
+        break;
+    }
+    wcsncpy(out, text, (size_t)cap - 1);
+    out[cap - 1] = L'\0';
+}
+
+/* Remember that this switch is what the user just asked for, so the details
+ * window opens by itself if the worker comes back having failed at it. */
+static void expect_report(wc_switch sw, bool on)
+{
+    g_report_sw  = (int)sw;
+    g_report_on  = on;
+    g_report_seq = g_seq;
+    g_report_at  = GetTickCount();
+}
+
 /* The worker can be busy for seconds, and a snapshot it sends before it gets
  * to a change still shows the old value.  So every change is numbered, each
  * snapshot says which it has seen, and one that is behind keeps what the
@@ -466,6 +609,7 @@ static void set_nuclear(HWND hwnd, bool on)
 {
     ui_switch_set(GetDlgItem(hwnd, IDC_NUKE), on);
     EnableWindow(GetDlgItem(hwnd, IDC_NUKE_FOR), !on);
+    expect_report(WC_SW_NUCLEAR, on);
     if (on) {
         arm_deadman(hwnd);
     } else {
@@ -496,11 +640,12 @@ static bool confirm_nuclear(HWND hwnd)
 /* The switches that are saved, unlike the arm above.  None of them can leave
  * anything stuck: the two opcodes are handed back when the app exits, and what
  * Metered and Performance change is recognised by its value or recorded. */
-static void set_saved(HWND hwnd, int id, void (*save)(bool), UINT msg, bool on)
+static void set_saved(HWND hwnd, int id, wc_switch sw, void (*save)(bool), UINT msg, bool on)
 {
     ui_switch_set(GetDlgItem(hwnd, id), on);
     save(on);
     post_switch(msg, on);
+    expect_report(sw, on);
 }
 
 static bool flipped(HWND hwnd, int id)
@@ -577,7 +722,7 @@ static void sync_manage(HWND hwnd)
 
 static void apply_fonts(HWND hwnd)
 {
-    static const int ids[] = { IDC_NUKE_FOR, IDC_TUNE, IDC_REFRESH };
+    static const int ids[] = { IDC_NUKE_FOR, IDC_TUNE, IDC_REFRESH, IDC_DETAILS };
     for (size_t i = 0; i < sizeof ids / sizeof ids[0]; ++i)
         SendMessageW(GetDlgItem(hwnd, ids[i]), WM_SETFONT, (WPARAM)g_f.body, FALSE);
     for (int k = 0; k < N_SWITCHES; ++k)
@@ -617,8 +762,9 @@ static void layout(HWND hwnd, const RECT *at)
     place_manage();
 
     const int by = ch - P(PAD) - P(ROW_H);
-    SetWindowPos(GetDlgItem(hwnd, IDC_TUNE),    nullptr, P(PAD - 8),      by, P(84), P(ROW_H), fl);
-    SetWindowPos(GetDlgItem(hwnd, IDC_REFRESH), nullptr, P(PAD - 8 + 88), by, P(72), P(ROW_H), fl);
+    SetWindowPos(GetDlgItem(hwnd, IDC_TUNE),    nullptr, P(PAD - 8),       by, P(84), P(ROW_H), fl);
+    SetWindowPos(GetDlgItem(hwnd, IDC_REFRESH), nullptr, P(PAD - 8 + 88),  by, P(72), P(ROW_H), fl);
+    SetWindowPos(GetDlgItem(hwnd, IDC_DETAILS), nullptr, P(PAD - 8 + 164), by, P(92), P(ROW_H), fl);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -665,7 +811,11 @@ static void open_tuning(HWND hwnd)
     wc_guid g = g_snap->row[pick].guid;
     wchar_t name[WC_NAME_MAX];
     wcscpy(name, g_snap->row[pick].name);
+    /* Snapshots still arrive while this is up; nothing else may open a window
+     * over it. */
+    g_modal = true;
     tune_dialog(hwnd, &g, name, g_snap->perf);
+    g_modal = false;
 }
 
 /* --------------------------------------------------------------- dlg proc */
@@ -701,6 +851,7 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                                        DEVICE_NOTIFY_WINDOW_HANDLE);
         ui_control(hwnd, IDC_TUNE, UI_LINK, L"Tuning  ›", false);
         ui_control(hwnd, IDC_REFRESH, UI_LINK, L"Refresh", false);
+        ui_control(hwnd, IDC_DETAILS, UI_LINK, L"Details", false);
         apply_fonts(hwnd);
 
         g_icon_big = make_icon(GetSystemMetrics(SM_CXICON), ICON_HELD, ICON_FILL);
@@ -743,8 +894,27 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         ui_switch_set(GetDlgItem(hwnd, IDC_METERED), g_snap && g_snap->metered);
         ui_switch_set(GetDlgItem(hwnd, IDC_PERF), g_snap && g_snap->perf);
         sync_manage(hwnd);
+        sync_availability(hwnd);
         InvalidateRect(g_cards, nullptr, FALSE);
         update_status(hwnd);
+
+        /* The worker has caught up with the switch the user flipped -- and a
+         * restart sends a snapshot part way through, which is not the answer.
+         * If anything failed since they flipped it, say so in full rather than
+         * in one line they may not be looking at. */
+        if (g_report_sw >= 0 && g_snap && !g_modal && !g_snap->perf_busy &&
+            g_snap->seq >= g_report_seq) {
+            const int sw = g_report_sw;
+            const bool on = g_report_on;
+            g_report_sw = -1;
+            if (diag_count_since(&g_snap->diag, DIAG_WARN, g_report_at) > 0) {
+                wchar_t headline[512];
+                report_headline(sw, on, headline, 512);
+                g_modal = true;
+                diag_dialog(hwnd, g_snap, headline);
+                g_modal = false;
+            }
+        }
         return TRUE;
     }
 
@@ -775,12 +945,14 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_BGSCAN:
         case IDM_BGSCAN:
             if (click)
-                set_saved(hwnd, IDC_BGSCAN, cfg_save_bgscan_off, WM_W_BGSCAN, flipped(hwnd, IDC_BGSCAN));
+                set_saved(hwnd, IDC_BGSCAN, WC_SW_BGSCAN, cfg_save_bgscan_off, WM_W_BGSCAN,
+                          flipped(hwnd, IDC_BGSCAN));
             return TRUE;
         case IDC_STREAM:
         case IDM_STREAM:
             if (click)
-                set_saved(hwnd, IDC_STREAM, cfg_save_streaming_on, WM_W_STREAMING, flipped(hwnd, IDC_STREAM));
+                set_saved(hwnd, IDC_STREAM, WC_SW_STREAMING, cfg_save_streaming_on,
+                          WM_W_STREAMING, flipped(hwnd, IDC_STREAM));
             return TRUE;
         case IDC_NUKE: {
             if (!click) return TRUE;
@@ -790,18 +962,25 @@ static INT_PTR CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return TRUE;
         }
         case IDC_METERED:
-            if (click) set_saved(hwnd, IDC_METERED, cfg_save_metered, WM_W_METERED, flipped(hwnd, IDC_METERED));
+            if (click)
+                set_saved(hwnd, IDC_METERED, WC_SW_METERED, cfg_save_metered, WM_W_METERED,
+                          flipped(hwnd, IDC_METERED));
             return TRUE;
         case IDC_PERF:
         case IDM_PERF: {
             if (!click) return TRUE;
             const bool on = flipped(hwnd, IDC_PERF);
             if (on && !confirm_perf(hwnd)) return TRUE;
-            set_saved(hwnd, IDC_PERF, cfg_save_perf, WM_W_PERF, on);
+            set_saved(hwnd, IDC_PERF, WC_SW_PERF, cfg_save_perf, WM_W_PERF, on);
             return TRUE;
         }
         case IDC_REFRESH:
-            if (click) PostMessageW(g_worker, WM_W_POLL, 0, 0);
+            /* Not just another poll: what is available is probed again, and the
+             * failure log starts over, so what is shown describes now. */
+            if (click) PostMessageW(g_worker, WM_W_RECHECK, 0, 0);
+            return TRUE;
+        case IDC_DETAILS:
+            if (click) diag_dialog(hwnd, g_snap, nullptr);
             return TRUE;
         case IDC_TUNE:
             if (click) open_tuning(hwnd);

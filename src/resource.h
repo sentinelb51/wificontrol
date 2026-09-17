@@ -10,11 +10,17 @@
 #define IDC_STREAM   1010
 #define IDC_MANAGE   1100 /* + adapter index */
 
+#define IDC_DETAILS  1011
+
 #define IDD_TUNE          200
 #define IDC_TUNE_PANEL   2002
 #define IDC_TUNE_APPLY   2005
 #define IDC_TUNE_RESTART 2006
 #define IDC_TUNE_VALUE   3000 /* + setting index */
+
+#define IDD_DIAG          300
+#define IDC_DIAG_PANEL   4001
+#define IDC_DIAG_COPY    4002
 
 #define IDM_SHOW    40001
 #define IDM_BGSCAN  40002

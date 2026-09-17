@@ -31,6 +31,26 @@ static const perf_item PRESET[] = {
 };
 enum { PRESET_N = sizeof PRESET / sizeof PRESET[0] };
 
+/* A backend addresses a setting by the preset's name; this is what a person
+ * calls it, for the log the window shows.  An unknown name is its own label. */
+const char *perf_label(const char *name)
+{
+    static const struct { const char *name, *label; } LABEL[] = {
+        { WIFI_POWER "\\ac",     "Wireless power saving, plugged in" },
+        { WIFI_POWER "\\dc",     "Wireless power saving, on battery" },
+        { PCIE_ASPM "\\ac",      "PCIe link state power management, plugged in" },
+        { PCIE_ASPM "\\dc",      "PCIe link state power management, on battery" },
+        { "MIMOPowerSaveMode", "MIMO power save" },
+        { "uAPSDSupport",      "U-APSD (WMM power save)" },
+        { "IbssTxPower",       "Transmit power" },
+        { "*SelectiveSuspend", "Selective suspend" },
+        { "WiFiDirect",        "the Wi-Fi Direct adapters" },
+    };
+    for (size_t i = 0; i < sizeof LABEL / sizeof LABEL[0]; ++i)
+        if (strcmp(LABEL[i].name, name) == 0) return LABEL[i].label;
+    return name;
+}
+
 typedef struct { perf_entry e[PERF_MAX_HELD]; int n; } journal;
 
 static void load(const perf_backend *be, journal *j)
@@ -66,9 +86,20 @@ static bool recorded(const journal *j, perf_kind k, const wc_guid *owner, const 
     return false;
 }
 
-static void fail(perf_result *r, unsigned long e)
+static diag_op op_of(perf_kind k)
 {
-    if (e && !r->err) r->err = e;
+    return k == PERF_DRIVER ? DIAG_PERF_DRIVER
+         : k == PERF_POWER  ? DIAG_PERF_POWER
+                            : DIAG_PERF_DEVICE;
+}
+
+/* Report one failure and keep the first of them for the result. */
+static void oops(const perf_backend *be, perf_result *r, diag_op op, diag_step step,
+                 const wc_guid *owner, const char *name, unsigned long e)
+{
+    if (!e) return;
+    if (be->note) be->note(be->ctx, op, step, owner, name, e);
+    if (!r->err) r->err = e;
 }
 
 /* Move one setting to its target.  True when something was written. */
@@ -80,7 +111,7 @@ static bool hold(const perf_backend *be, const journal *j, const perf_item *it,
     unsigned long e = be->read(be->ctx, it->kind, owner, it->name, it->target,
                                live, sizeof live, &accepts);
     if (e == PERF_ABSENT || (e == WC_OK && !accepts)) return false;
-    if (e) { fail(r, e); return false; }
+    if (e) { oops(be, r, op_of(it->kind), DIAG_READ, owner, it->name, e); return false; }
     if (strcmp(live, it->target) == 0) return false;
 
     /* Recorded before it is written, so a crash in between still leaves the
@@ -90,10 +121,15 @@ static bool hold(const perf_backend *be, const journal *j, const perf_item *it,
     snprintf(rec.name, sizeof rec.name, "%s", it->name);
     snprintf(rec.value, sizeof rec.value, "%s", live);
     const bool fresh = !recorded(j, it->kind, owner, it->name);
-    if (fresh && (e = be->keep(be->ctx, &rec))) { fail(r, e); return false; }
+    if (fresh && (e = be->keep(be->ctx, &rec))) {
+        /* Nothing is written without the record: holding a value with no way
+         * back is the one outcome this switch must not produce. */
+        oops(be, r, DIAG_PERF_JOURNAL, DIAG_RECORD, owner, it->name, e);
+        return false;
+    }
 
     if ((e = be->write(be->ctx, it->kind, owner, it->name, it->target))) {
-        fail(r, e);
+        oops(be, r, op_of(it->kind), DIAG_WRITE, owner, it->name, e);
         if (fresh) be->forget(be->ctx, &rec);
         return false;
     }
@@ -111,20 +147,24 @@ static bool put_back(const perf_backend *be, const perf_entry *rec, perf_result 
     unsigned long e = it ? be->read(be->ctx, rec->kind, &rec->owner, rec->name, it->target,
                                     live, sizeof live, &accepts)
                          : PERF_ABSENT;
-    if (e && e != PERF_ABSENT) { fail(r, e); return false; }
+    if (e && e != PERF_ABSENT) {
+        oops(be, r, op_of(rec->kind), DIAG_READ, &rec->owner, rec->name, e);
+        return false;
+    }
 
     /* Only a value still at ours goes back.  Anything else was changed since,
      * by someone else, and theirs stands. */
     bool wrote = false;
     if (!e && strcmp(live, it->target) == 0) {
         if ((e = be->write(be->ctx, rec->kind, &rec->owner, rec->name, rec->value))) {
-            fail(r, e);
+            oops(be, r, op_of(rec->kind), DIAG_RESTORE, &rec->owner, rec->name, e);
             return false;
         }
         r->changed++;
         wrote = true;
     }
-    fail(r, be->forget(be->ctx, rec));
+    oops(be, r, DIAG_PERF_JOURNAL, DIAG_RECORD, &rec->owner, rec->name,
+         be->forget(be->ctx, rec));
     return wrote;
 }
 
@@ -137,7 +177,7 @@ perf_result perf_sync_power(const perf_backend *be, bool want)
     wc_guid active;
     unsigned long e = be->scheme(be->ctx, &active);
     const bool known = (e == WC_OK);
-    if (want && !known) fail(&r, e);
+    if (want && !known) oops(be, &r, DIAG_PERF_PLAN, DIAG_READ, nullptr, nullptr, e);
 
     bool dirty = false; /* the active scheme was written */
     if (want && known)
@@ -154,7 +194,9 @@ perf_result perf_sync_power(const perf_backend *be, bool want)
         if (put_back(be, rec, &r) && (on_active || !known)) dirty = true;
     }
 
-    if (dirty) fail(&r, be->commit(be->ctx));
+    if (dirty)
+        oops(be, &r, DIAG_PERF_PLAN, DIAG_WRITE, known ? &active : nullptr, nullptr,
+             be->commit(be->ctx));
     r.held = count(be);
     return r;
 }
@@ -191,7 +233,7 @@ perf_result perf_sync_adapters(const perf_backend *be, const perf_adapter *ad, i
     for (int i = 0; i < n; ++i) {
         if (!changed[i] || !ad[i].present || !restart) continue;
         unsigned long e = be->restart(be->ctx, &ad[i].guid);
-        if (e) fail(&r, e);
+        if (e) oops(be, &r, DIAG_RESTART, DIAG_WRITE, &ad[i].guid, nullptr, e);
         else   r.restarted++;
     }
     r.held = count(be);

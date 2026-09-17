@@ -28,10 +28,11 @@ typedef struct {
     setting    s[32];
     int        n;
     wc_guid    active;
-    unsigned long scheme_err, keep_err;
+    unsigned long scheme_err, keep_err, restart_err;
     perf_entry j[PERF_MAX_HELD];
     int        nj;
     int        writes, commits, restarts[4];
+    diag_log   log;                  /* what the switch reported, in order */
 } fake;
 
 static wc_guid G(int k) { wc_guid g = { { 0 } }; g.b[0] = (unsigned char)k; return g; }
@@ -120,8 +121,28 @@ static unsigned long f_commit(void *ctx) { ((fake *)ctx)->commits++; return WC_O
 
 static unsigned long f_restart(void *ctx, const wc_guid *g)
 {
-    ((fake *)ctx)->restarts[g->b[0]]++;
+    fake *f = ctx;
+    if (f->restart_err) return f->restart_err;
+    f->restarts[g->b[0]]++;
     return WC_OK;
+}
+
+/* The app puts these in front of the user; here they are just recorded. */
+static void f_note(void *ctx, diag_op op, diag_step step, const wc_guid *owner,
+                   const char *name, unsigned long err)
+{
+    fake *f = ctx;
+    char subject[DIAG_SUBJ_MAX];
+    snprintf(subject, sizeof subject, "%s/%u", name ? perf_label(name) : "",
+             owner ? (unsigned)owner->b[0] : 0u);
+    diag_note(&f->log, op, step, subject, err, 1);
+}
+
+static const diag_entry *reported(fake *f, diag_op op, diag_step step)
+{
+    for (int i = 0; i < f->log.n; ++i)
+        if (f->log.e[i].op == op && f->log.e[i].step == step) return &f->log.e[i];
+    return nullptr;
 }
 
 static int f_held(void *ctx, perf_entry *out, int cap)
@@ -170,7 +191,7 @@ static perf_backend backend(fake *f)
 {
     return (perf_backend){ .ctx = f, .read = f_read, .write = f_write, .scheme = f_scheme,
                            .commit = f_commit, .restart = f_restart, .held = f_held,
-                           .keep = f_keep, .forget = f_forget };
+                           .keep = f_keep, .forget = f_forget, .note = f_note };
 }
 
 static void setup(fake *f)
@@ -480,6 +501,76 @@ static void t_unknown_scheme(void)
     CHECK(perf_sync_power(&be, false).err == WC_OK);
 }
 
+static void t_a_failure_names_the_setting(void)
+{
+    printf("a failure names the setting and the adapter it happened on\n");
+    fake f;
+    setup(&f);
+    find(&f, PERF_DRIVER, &(wc_guid){ { 1 } }, "uAPSDSupport")->w_err = 5;
+    perf_backend be = backend(&f);
+    perf_adapter ad[] = { { G(1), true, true } };
+
+    perf_sync(&be, true, ad, 1, true);
+    const diag_entry *e = reported(&f, DIAG_PERF_DRIVER, DIAG_WRITE);
+    CHECK(e && e->code == 5);
+    CHECK(e && !strcmp(e->subject, "U-APSD (WMM power save)/1"));
+    /* One property refusing does not report the others. */
+    CHECK(diag_count(&f.log, DIAG_WARN) == 1);
+}
+
+static void t_a_journal_that_cannot_record_is_reported_as_such(void)
+{
+    printf("a journal that cannot record is reported, and nothing is changed\n");
+    fake f;
+    setup(&f);
+    f.keep_err = 5;
+    perf_backend be = backend(&f);
+    perf_adapter ad[] = { { G(1), true, true } };
+
+    perf_result r = perf_sync(&be, true, ad, 1, true);
+    CHECK(r.changed == 0 && r.held == 0);
+    CHECK(reported(&f, DIAG_PERF_JOURNAL, DIAG_RECORD) != nullptr);
+    /* Not filed against the setting: the setting was never touched. */
+    CHECK(reported(&f, DIAG_PERF_DRIVER, DIAG_WRITE) == nullptr);
+}
+
+static void t_a_failed_restart_is_reported(void)
+{
+    printf("a restart that fails is reported as the serious thing it is\n");
+    fake f;
+    setup(&f);
+    f.restart_err = 31;
+    perf_backend be = backend(&f);
+    perf_adapter ad[] = { { G(1), true, true } };
+
+    perf_result r = perf_sync(&be, true, ad, 1, true);
+    CHECK(r.restarted == 0 && r.err == 31);
+    const diag_entry *e = reported(&f, DIAG_RESTART, DIAG_WRITE);
+    CHECK(e && diag_sev_of(e->op, e->code) == DIAG_ERR);
+}
+
+static void t_an_unreadable_plan_is_reported_against_the_plan(void)
+{
+    printf("an unreadable power plan is reported against the plan itself\n");
+    fake f;
+    setup(&f);
+    f.scheme_err = 1168;
+    perf_backend be = backend(&f);
+
+    perf_sync_power(&be, true);
+    CHECK(reported(&f, DIAG_PERF_PLAN, DIAG_READ) != nullptr);
+}
+
+static void t_labels(void)
+{
+    printf("every setting in the preset has words for it\n");
+    CHECK(!strcmp(perf_label("MIMOPowerSaveMode"), "MIMO power save"));
+    CHECK(!strcmp(perf_label(WIFI_DC), "Wireless power saving, on battery"));
+    CHECK(!strcmp(perf_label(ASPM_AC), "PCIe link state power management, plugged in"));
+    /* Anything unknown is its own label rather than nothing. */
+    CHECK(!strcmp(perf_label("SomethingElse"), "SomethingElse"));
+}
+
 int main(void)
 {
     t_holds_and_records_only_what_it_changes();
@@ -498,6 +589,11 @@ int main(void)
     t_unmanaged_and_absent_adapters();
     t_session_end_does_not_restart();
     t_unknown_scheme();
+    t_a_failure_names_the_setting();
+    t_a_journal_that_cannot_record_is_reported_as_such();
+    t_a_failed_restart_is_reported();
+    t_an_unreadable_plan_is_reported_against_the_plan();
+    t_labels();
 
     if (failures) { printf("\n%d check(s) failed\n", failures); return 1; }
     printf("\nall checks passed\n");

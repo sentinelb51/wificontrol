@@ -329,6 +329,21 @@ unsigned long tune_driver_get(const wc_guid *adapter, const wchar_t *keyword,
     return ERROR_SUCCESS;
 }
 
+/* Opened for writing and closed again, so a driver key behind a policy is
+ * found now rather than on the first attempt to hold a value. */
+unsigned long tune_driver_check(const wc_guid *adapter)
+{
+    wchar_t inst_key[MAX_PATH];
+    if (!find_instance(adapter, inst_key, MAX_PATH)) return ERROR_FILE_NOT_FOUND;
+
+    HKEY inst;
+    LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, inst_key, 0,
+                           KEY_QUERY_VALUE | KEY_SET_VALUE, &inst);
+    if (r != ERROR_SUCCESS) return (unsigned long)r;
+    RegCloseKey(inst);
+    return ERROR_SUCCESS;
+}
+
 unsigned long tune_driver_set(const wc_guid *adapter, const wchar_t *keyword, const wchar_t *raw)
 {
     wchar_t inst_key[MAX_PATH];

@@ -10,4 +10,11 @@
  * must outlive the backend. */
 void perf_win32_backend(perf_backend *be, const wchar_t *journal);
 
+/* The two things the switch cannot work without, checked before it is offered
+ * rather than discovered half way through: the journal it puts values back
+ * from, and an active power plan.  WC_OK, or the reason it is unavailable.
+ * The driver properties are the third, and are per adapter: tune_driver_check. */
+unsigned long perf_win32_journal_check(const wchar_t *journal);
+unsigned long perf_win32_power_check(void);
+
 #endif

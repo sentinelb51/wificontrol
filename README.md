@@ -46,6 +46,16 @@ Independent of each other; each applies to every adapter whose card has **Manage
   It also disables the Wi-Fi Direct adapters, so Miracast, Mobile Hotspot and Wi-Fi Direct stop working.
   The adapter restarts to apply it (Wi-Fi drops for a few seconds), and battery life suffers. The old values are saved first and put back when you're done
 
+### Errors
+- **Nothing pretends to work**; a switch whose service is not on this machine is greyed out with the reason where its
+  description would be, rather than failing when you flip it. Windows 7 has no connection-cost API, so **Metered** says so;
+  a stopped WLAN AutoConfig service greys out the three that need it; **Performance** will not hold a value it could not put back
+- **Checked again on Refresh**; every setting, every adapter and everything above, and the problem list starts over,
+  so what it shows describes now. A WLAN service that was not running when the app started is picked up there too
+- **Details**; every failure since that check, each with the setting and adapter it happened on, the error Windows gave,
+  and one line on the likely cause and what to do about it. It opens by itself when a switch you just flipped could not be
+  applied in full, and **Copy** puts the whole thing on the clipboard
+
 ### Tuning
 - **Driver advanced properties**; read from the driver itself, so you get whatever your card exposes, under the names it gives them
 - **Wi-Fi power settings**; adapter power saving mode and PCIe link state power management, plugged in and on battery
@@ -70,7 +80,8 @@ that's one prompt per start, and no permission problems after that.
 
 Each adapter gets a card with its connection and what the driver reported for each setting.
 Switch **Manage** off on a card to leave that adapter alone. Turning a switch off hands its setting back without quitting,
-and every switch except **Block all scans** is remembered. **Exit** in the tray menu actually quits, and puts everything back.
+and every switch except **Block all scans** is remembered. **Refresh** re-reads everything and re-checks what this machine can do;
+**Details** says what has failed since then and what to do about it. **Exit** in the tray menu actually quits, and puts everything back.
 
 ### Starting with Windows
 Apps that need administrator **can't** start from the Startup folder or a `Run` key; Windows silently skips them at logon.

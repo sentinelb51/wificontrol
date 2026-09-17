@@ -60,6 +60,13 @@ typedef struct perf_backend {
     int           (*held)   (void *ctx, perf_entry *out, int cap);
     unsigned long (*keep)   (void *ctx, const perf_entry *e);   /* add or replace */
     unsigned long (*forget) (void *ctx, const perf_entry *e);
+
+    /* Optional.  Every failure, with the setting it happened on, so the window
+     * can name the one property that would not move instead of showing a
+     * single code for the whole switch.  `owner` is null for the power plan
+     * itself, `name` for anything with no setting to name. */
+    void          (*note)   (void *ctx, diag_op op, diag_step step, const wc_guid *owner,
+                             const char *name, unsigned long err);
 } perf_backend;
 
 typedef struct {
@@ -74,6 +81,9 @@ typedef struct {
     int           restarted; /* adapters restarted */
     unsigned long err;       /* the first failure, or WC_OK */
 } perf_result;
+
+/* What a person calls one of the preset's settings, for the failure log. */
+const char *perf_label(const char *name);
 
 /* Power: hold the preset on the active scheme when wanted, and put back
  * everything recorded against any other scheme, or all of it when not. */

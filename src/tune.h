@@ -81,6 +81,8 @@ unsigned long tune_restart_adapter(const tune_list *l);
 unsigned long tune_driver_get    (const wc_guid *adapter, const wchar_t *keyword,
                                   const wchar_t *choice, wchar_t *live, int cap, bool *has_choice);
 unsigned long tune_driver_set    (const wc_guid *adapter, const wchar_t *keyword, const wchar_t *raw);
+/* Whether this adapter's properties can be written at all: WC_OK, or why not. */
+unsigned long tune_driver_check  (const wc_guid *adapter);
 unsigned long tune_driver_restart(const wc_guid *adapter);
 
 /* The Wi-Fi Direct adapters one by one, also for the Performance switch.  A

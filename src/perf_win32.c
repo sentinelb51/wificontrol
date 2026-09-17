@@ -207,6 +207,43 @@ static unsigned long b_forget(void *ctx, const perf_entry *e)
     return err == ERROR_FILE_NOT_FOUND ? WC_OK : err;
 }
 
+/* Whether the journal can be written at all.  Nothing is created: an existing
+ * record is opened for writing and closed again, and for a first run it is the
+ * folder that is tested, with a file that deletes itself on close.  Without
+ * this the switch would hold values it could not put back. */
+unsigned long perf_win32_journal_check(const wchar_t *journal)
+{
+    if (!journal || !journal[0]) return ERROR_PATH_NOT_FOUND;
+
+    if (GetFileAttributesW(journal) != INVALID_FILE_ATTRIBUTES) {
+        HANDLE h = CreateFileW(journal, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return GetLastError();
+        CloseHandle(h);
+        return WC_OK;
+    }
+
+    wchar_t probe[MAX_PATH];
+    _snwprintf(probe, MAX_PATH, L"%s.probe", journal);
+    probe[MAX_PATH - 1] = L'\0';
+    HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError();
+    CloseHandle(h);
+    return WC_OK;
+}
+
+/* Whether there is an active power plan to hold anything in. */
+unsigned long perf_win32_power_check(void)
+{
+    GUID *g = nullptr;
+    DWORD e = PowerGetActiveScheme(nullptr, &g);
+    if (e) return e;
+    if (!g) return ERROR_NOT_FOUND;
+    LocalFree(g);
+    return WC_OK;
+}
+
 void perf_win32_backend(perf_backend *be, const wchar_t *journal)
 {
     *be = (perf_backend){
