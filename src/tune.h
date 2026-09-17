@@ -1,10 +1,11 @@
 /* tune.h -- user-chosen device and power settings.
  *
  * Everything here is presented as a dropdown of the values the system itself
- * declares, and nothing is written until the user presses Apply.  The app
+ * declares, and nothing is written until the user presses Apply.  The dialog
  * never picks a value, never recommends one, and never records what a setting
  * used to be: the registry and the power scheme are the state.  Undo is
- * choosing the other value from the same dropdown.
+ * choosing the other value from the same dropdown.  The one exception to all
+ * of that is the Performance switch, which keeps its own record (perf.h).
  */
 #ifndef WIFICONTROL_TUNE_H
 #define WIFICONTROL_TUNE_H
@@ -34,6 +35,7 @@ typedef struct {
     int         cur;    /* index into opt of the live value, -1 if unrecognised */
     int         sel;    /* index the user has chosen; equals cur until they act */
     const wchar_t *help; /* one line on what the setting does, or nullptr if unknown */
+    bool        asleep; /* driver: does nothing until the PC sleeps */
 
     /* provider-private addressing */
     wchar_t     value_name[TUNE_KEY_MAX]; /* driver: registry value under the instance key */
@@ -72,6 +74,25 @@ int  tune_apply(tune_list *l, unsigned long *first_err);
  * the Wi-Fi link for a few seconds. */
 unsigned long tune_restart_adapter(const tune_list *l);
 
-void tune_dialog(HWND parent, const wc_guid *adapter, const wchar_t *adapter_name);
+/* One property at a time, for the Performance switch.  get reports the live
+ * raw value, or the driver's default when none is stored, and whether `choice`
+ * is one of the values it declares.  An adapter, or a property, that is not
+ * there is ERROR_FILE_NOT_FOUND.  restart is tune_restart_adapter by GUID. */
+unsigned long tune_driver_get    (const wc_guid *adapter, const wchar_t *keyword,
+                                  const wchar_t *choice, wchar_t *live, int cap, bool *has_choice);
+unsigned long tune_driver_set    (const wc_guid *adapter, const wchar_t *keyword, const wchar_t *raw);
+unsigned long tune_driver_restart(const wc_guid *adapter);
+
+/* The Wi-Fi Direct adapters one by one, also for the Performance switch.  A
+ * state is a '1' (enabled) or '0' (disabled) per adapter in a fixed order, and
+ * empty when the card has none.  set moves each adapter to its character, an
+ * adapter past the end taking the last one, so "0" disables them all.  A
+ * device that is disabled only once Windows restarts reads as disabled, and
+ * set then returns ERROR_SUCCESS_REBOOT_REQUIRED. */
+unsigned long tune_wfd_get(const wc_guid *adapter, char *state, int cap);
+unsigned long tune_wfd_set(const wc_guid *adapter, const char *state);
+
+/* perf_on: the Performance switch is holding some of these values. */
+void tune_dialog(HWND parent, const wc_guid *adapter, const wchar_t *adapter_name, bool perf_on);
 
 #endif

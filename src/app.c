@@ -8,6 +8,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include "app.h"
+#include "perf_win32.h"
 #include "ui.h"
 
 #include <commctrl.h>
@@ -26,30 +27,25 @@
 #define WATCHDOG_MS 60000
 
 typedef struct { wc_guid g; bool managed; } cfg_entry;
-typedef struct { bool enabled, dark, metered; int n; cfg_entry e[WC_MAX_ADAPTERS]; } cfg;
+typedef struct {
+    bool bgscan_off, streaming_on, dark, metered, perf;
+    int n;
+    cfg_entry e[WC_MAX_ADAPTERS];
+} cfg;
 
 /* ----------------------------------------------------------------- config */
 
 static wchar_t g_cfg_path[MAX_PATH];
+static wchar_t g_journal_path[MAX_PATH];
 
-static void guid_to_str(const wc_guid *g, wchar_t *buf, int cap)
+/* The Performance switch's record of what it changed, beside the config. */
+static void journal_resolve_path(void)
 {
-    wcw_guid_to_string(g, buf, cap);
-}
-
-static bool str_to_guid(const wchar_t *s, wc_guid *g)
-{
-    unsigned int d1, d2, d3, b[8];
-    if (swscanf(s, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
-                &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
-        return false;
-    GUID out;
-    out.Data1 = (unsigned long)d1;
-    out.Data2 = (unsigned short)d2;
-    out.Data3 = (unsigned short)d3;
-    for (int i = 0; i < 8; ++i) out.Data4[i] = (unsigned char)b[i];
-    memcpy(g->b, &out, sizeof g->b);
-    return true;
+    wcscpy(g_journal_path, g_cfg_path);
+    wchar_t *slash = wcsrchr(g_journal_path, L'\\');
+    if (slash) *slash = L'\0';
+    wcsncat(g_journal_path, L"\\wificontrol-restore.ini",
+            MAX_PATH - wcslen(g_journal_path) - 1);
 }
 
 /* Portable when an ini already sits next to the exe, per-user otherwise. */
@@ -78,9 +74,13 @@ static void cfg_resolve_path(void)
 static void cfg_load(cfg *c)
 {
     memset(c, 0, sizeof *c);
-    c->enabled = GetPrivateProfileIntW(L"general", L"enabled", 1, g_cfg_path) != 0;
-    c->dark    = GetPrivateProfileIntW(L"general", L"dark", 1, g_cfg_path) != 0;
-    c->metered = GetPrivateProfileIntW(L"general", L"metered", 0, g_cfg_path) != 0;
+    /* The first two used to be the one Optimise switch, saved as "enabled". */
+    const UINT both = GetPrivateProfileIntW(L"general", L"enabled", 1, g_cfg_path);
+    c->bgscan_off   = GetPrivateProfileIntW(L"general", L"no_background_scan", both, g_cfg_path) != 0;
+    c->streaming_on = GetPrivateProfileIntW(L"general", L"streaming_mode", both, g_cfg_path) != 0;
+    c->metered      = GetPrivateProfileIntW(L"general", L"metered", 1, g_cfg_path) != 0;
+    c->perf         = GetPrivateProfileIntW(L"general", L"performance", 0, g_cfg_path) != 0;
+    c->dark         = GetPrivateProfileIntW(L"general", L"dark", 1, g_cfg_path) != 0;
 
     /* Adapters absent from the file default to managed. */
     wchar_t buf[4096];
@@ -95,15 +95,20 @@ static void cfg_load(cfg *c)
         if (klen >= 64) continue;
         memcpy(key, p, klen * sizeof(wchar_t));
         key[klen] = L'\0';
-        if (!str_to_guid(key, &c->e[c->n].g)) continue;
+        if (!wcw_guid_from_string(key, &c->e[c->n].g)) continue;
         c->e[c->n].managed = (_wtoi(eq + 1) != 0);
         c->n++;
     }
 }
 
-void cfg_save_enabled(bool on)
+void cfg_save_bgscan_off(bool on)
 {
-    WritePrivateProfileStringW(L"general", L"enabled", on ? L"1" : L"0", g_cfg_path);
+    WritePrivateProfileStringW(L"general", L"no_background_scan", on ? L"1" : L"0", g_cfg_path);
+}
+
+void cfg_save_streaming_on(bool on)
+{
+    WritePrivateProfileStringW(L"general", L"streaming_mode", on ? L"1" : L"0", g_cfg_path);
 }
 
 void cfg_save_dark(bool on)
@@ -116,10 +121,15 @@ void cfg_save_metered(bool on)
     WritePrivateProfileStringW(L"general", L"metered", on ? L"1" : L"0", g_cfg_path);
 }
 
+void cfg_save_perf(bool on)
+{
+    WritePrivateProfileStringW(L"general", L"performance", on ? L"1" : L"0", g_cfg_path);
+}
+
 void cfg_save_managed(const wc_guid *g, bool on)
 {
     wchar_t key[64];
-    guid_to_str(g, key, 64);
+    wcw_guid_to_string(g, key, 64);
     WritePrivateProfileStringW(L"adapters", key, on ? L"1" : L"0", g_cfg_path);
 }
 
@@ -127,56 +137,49 @@ void cfg_save_managed(const wc_guid *g, bool on)
 
 /* Drawn into a DIB rather than shipped as a .ico: it costs less code than a
  * binary asset, comes out crisp at whatever size the shell asks for, and lets
- * the tray colour carry the state. */
-static void raster(unsigned char *px, int size, COLORREF c)
+ * the tray colour carry the state.
+ *
+ * The glyph is a dot in the bottom-left corner and two quarter rings around
+ * that corner, cut flat by its edges, on a transparent background. */
+static void raster(unsigned char *px, int size, COLORREF c, double fill)
 {
-    const double R = size * 0.5 - 0.5, cx = size * 0.5, cy = size * 0.5;
-    const double ox = cx, oy = cy + size * 0.26;
-    const double dotr = size * 0.085, halfw = size * 0.055;
-    const double rad[3] = { size * 0.20, size * 0.33, size * 0.46 };
-    constexpr int S = 4;  /* supersampling factor */
-    const double cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
+    /* Whole pixels throughout: the corner sits on a pixel boundary, so each
+     * cut end of a ring is crisp at 16 px rather than half-covered. */
+    const int g = (int)(size * fill + 0.5), m = (size - g) / 2;   /* glyph, margin */
+    const int t = (int)(g * 0.115 + 0.5), r1 = (int)(g * 0.66 + 0.5);
+    const double left = m, bottom = m + g;
+    const double dot = t;   /* radius: twice a ring's width across, touching both edges */
+    const double ring[2][2] = { { r1 - t, r1 }, { g - t, g } };
+    constexpr int S = 8;  /* supersampling factor */
 
     for (int y = 0; y < size; ++y) {
         for (int x = 0; x < size; ++x) {
-            int disc = 0, glyph = 0;
+            int hits = 0;
             for (int sy = 0; sy < S; ++sy) {
                 for (int sx = 0; sx < S; ++sx) {
-                    double fx = x + (sx + 0.5) / S, fy = y + (sy + 0.5) / S;
-                    double dx = fx - cx, dy = fy - cy;
-                    if (dx * dx + dy * dy <= R * R) disc++;
-
-                    double gx = fx - ox, gy = fy - oy;
+                    double gx = x + (sx + 0.5) / S - left;
+                    double gy = bottom - (y + (sy + 0.5) / S);
+                    if (gx < 0 || gy < 0) continue;
                     double d = sqrt(gx * gx + gy * gy);
-                    int hit = (d <= dotr);
-                    if (!hit && gy < 0) {
-                        double ang = atan2(-gy, gx);           /* 0..pi upward */
-                        if (ang > 0.60 && ang < 2.54) {
-                            for (int k = 0; k < 3; ++k)
-                                if (fabs(d - rad[k]) <= halfw) { hit = 1; break; }
-                        }
-                    }
-                    if (hit) glyph++;
+                    double ex = gx - dot, ey = gy - dot;
+                    if (ex * ex + ey * ey <= dot * dot ||
+                        (d >= ring[0][0] && d <= ring[0][1]) ||
+                        (d >= ring[1][0] && d <= ring[1][1]))
+                        hits++;
                 }
             }
-            double da = (double)disc / (S * S);
-            double ga = (double)glyph / (S * S);
-            if (ga > da) ga = da;
-            double k = (da > 0.0) ? ga / da : 0.0;
+            double a = (double)hits / (S * S);
 
             unsigned char *p = px + ((size_t)y * (size_t)size + (size_t)x) * 4;
-            double b = cb + (255.0 - cb) * k;
-            double g = cg + (255.0 - cg) * k;
-            double r = cr + (255.0 - cr) * k;
-            p[0] = (unsigned char)(b * da + 0.5);   /* premultiplied BGRA */
-            p[1] = (unsigned char)(g * da + 0.5);
-            p[2] = (unsigned char)(r * da + 0.5);
-            p[3] = (unsigned char)(da * 255.0 + 0.5);
+            p[0] = (unsigned char)(GetBValue(c) * a + 0.5);   /* premultiplied BGRA */
+            p[1] = (unsigned char)(GetGValue(c) * a + 0.5);
+            p[2] = (unsigned char)(GetRValue(c) * a + 0.5);
+            p[3] = (unsigned char)(a * 255.0 + 0.5);
         }
     }
 }
 
-HICON make_icon(int size, COLORREF c)
+HICON make_icon(int size, COLORREF c, double fill)
 {
     BITMAPV5HEADER bi;
     memset(&bi, 0, sizeof bi);
@@ -197,7 +200,7 @@ HICON make_icon(int size, COLORREF c)
     ReleaseDC(NULL, dc);
     if (!color || !bits) { if (color) DeleteObject(color); return NULL; }
 
-    raster(bits, size, c);
+    raster(bits, size, c, fill);
 
     size_t mask_bytes = (size_t)(((size + 31) / 32) * 4) * (size_t)size;
     void *zero = calloc(1, mask_bytes);
@@ -230,19 +233,31 @@ static cfg       g_boot_cfg;
 static DWORD     g_last_poll;
 static unsigned long g_open_err;
 
+static perf_backend g_perf_be;
+static unsigned long (*g_perf_restart)(void *ctx, const wc_guid *adapter);
+static bool         g_perf;      /* the switch, as last sent by the window */
+static bool         g_perf_busy;
+static perf_result  g_perf_res;
+static unsigned     g_seq;       /* the window's newest switch change handled */
+
 static void worker_send_snapshot(void)
 {
     snapshot *s = calloc(1, sizeof *s);
     if (!s) return;
 
     s->n          = g_core.n;
-    s->enabled    = g_core.enabled;
+    s->bgscan_off   = g_core.bgscan_off;
+    s->streaming_on = g_core.streaming_on;
     s->nuclear    = g_core.nuclear;
     s->metered    = g_core.metered;
+    s->perf       = g_perf;
+    s->perf_busy  = g_perf_busy;
+    s->perf_err   = g_perf_res.err;
     s->recovered  = g_core.recovered;
     s->write_denied = wc_write_denied(&g_core);
     s->enum_err   = g_core.enum_err;
     s->open_err   = g_open_err;
+    s->seq        = g_seq;
 
     for (int i = 0; i < g_core.n; ++i) {
         const wc_adapter *a = &g_core.ad[i];
@@ -262,6 +277,28 @@ static void worker_send_snapshot(void)
         r->name[WC_NAME_MAX - 1] = L'\0';
     }
     if (!PostMessageW(g_ui, WM_U_SNAPSHOT, 0, (LPARAM)s)) free(s);
+}
+
+/* A restart takes seconds and drops the link, so the window says so first. */
+static unsigned long worker_restart(void *ctx, const wc_guid *adapter)
+{
+    g_perf_busy = true;
+    worker_send_snapshot();
+    unsigned long e = g_perf_restart(ctx, adapter);
+    g_perf_busy = false;
+    return e;
+}
+
+/* In force: the switch on, and per adapter, managed and present.  Run on
+ * transitions only, never from the poll. */
+static void worker_perf(bool restart)
+{
+    perf_adapter ad[WC_MAX_ADAPTERS];
+    for (int i = 0; i < g_core.n; ++i) {
+        const wc_adapter *a = &g_core.ad[i];
+        ad[i] = (perf_adapter){ a->guid, g_perf && a->managed && a->present, a->present };
+    }
+    g_perf_res = perf_sync(&g_perf_be, g_perf, ad, g_core.n, restart);
 }
 
 static void worker_poll(void)
@@ -302,9 +339,41 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (wp == T_WATCHDOG) worker_poll();
         return 0;
 
-    case WM_W_ENABLE:
-        wc_set_enabled(&g_core, (int)wp);
+    case WM_W_BGSCAN:
+        g_seq = (unsigned)lp;
+        wc_set_bgscan_off(&g_core, wp != 0);
         worker_send_snapshot();
+        return 0;
+
+    case WM_W_STREAMING:
+        g_seq = (unsigned)lp;
+        wc_set_streaming_on(&g_core, wp != 0);
+        worker_send_snapshot();
+        return 0;
+
+    /* The count goes first: a restart sends a snapshot part way through. */
+    case WM_W_PERF:
+        g_seq = (unsigned)lp;
+        g_perf = wp != 0;
+        worker_perf(true);
+        worker_send_snapshot();
+        return 0;
+
+    case WM_W_PLAN: {
+        /* Another plan is active: hold it instead, and give the old one back. */
+        perf_result r = perf_sync_power(&g_perf_be, g_perf);
+        g_perf_res.held = r.held;
+        if (r.err) g_perf_res.err = r.err;
+        worker_send_snapshot();
+        return 0;
+    }
+
+    case WM_W_PERF_END:
+        /* The reboot applies the driver values, so no restart; the next start
+         * holds them again from the saved switch.  Off in memory only, so a
+         * late plan change cannot hold anything again on the way down. */
+        g_perf = false;
+        g_perf_res = perf_sync(&g_perf_be, false, nullptr, 0, false);
         return 0;
 
     case WM_W_NUCLEAR:
@@ -313,6 +382,7 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_W_METERED:
+        g_seq = (unsigned)lp;
         wc_set_metered(&g_core, (int)wp);
         worker_send_snapshot();
         return 0;
@@ -320,10 +390,12 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_W_MANAGE: {
         manage_cmd *c = (manage_cmd *)lp;
         if (c) {
+            g_seq = c->seq;
             int i = wc_find(&g_core, &c->g);
             if (i >= 0) wc_set_managed(&g_core, i, c->on);
             free(c);
         }
+        worker_perf(true);
         worker_send_snapshot();
         return 0;
     }
@@ -340,6 +412,9 @@ static LRESULT CALLBACK worker_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_core.metered = false;
             wc_poll(&g_core);
         }
+        /* After auto config is back, so the restarted adapter reconnects. */
+        g_perf = false;
+        worker_perf(true);
         wcw_unregister(&g_win32);
         wcw_close(&g_win32);
         PostQuitMessage(0);
@@ -372,10 +447,11 @@ static unsigned __stdcall worker_main([[maybe_unused]] void *param)
         wc_probe_access(&g_core);
 
         /* Enumerate and apply the saved choices *before* the first apply pass,
-         * so an adapter the user unchecked is never briefly optimized. */
+         * so an adapter the user unchecked is never briefly optimised. */
         wc_refresh(&g_core);
-        g_core.enabled = g_boot_cfg.enabled;
-        g_core.metered = g_boot_cfg.metered;
+        g_core.bgscan_off   = g_boot_cfg.bgscan_off;
+        g_core.streaming_on = g_boot_cfg.streaming_on;
+        g_core.metered      = g_boot_cfg.metered;
         for (int i = 0; i < g_boot_cfg.n; ++i) {
             int j = wc_find(&g_core, &g_boot_cfg.e[i].g);
             if (j >= 0) g_core.ad[j].managed = g_boot_cfg.e[i].managed;
@@ -386,7 +462,18 @@ static unsigned __stdcall worker_main([[maybe_unused]] void *param)
         wcw_register(&g_win32, acm_callback, NULL);
         SetTimer(g_worker, T_WATCHDOG, WATCHDOG_MS, NULL);
     }
+
+    perf_win32_backend(&g_perf_be, g_journal_path);
+    g_perf_restart = g_perf_be.restart;
+    g_perf_be.restart = worker_restart;
+    g_perf = g_boot_cfg.perf; /* so the first snapshot shows the saved switch */
+
     worker_send_snapshot();
+
+    /* Hold the saved switch, or repair a run that was killed while holding.
+     * Queued rather than run here: a restart must not delay the window.  Queued
+     * before the window can show, so it lands ahead of anything the user does. */
+    PostMessageW(g_worker, WM_W_PERF, (WPARAM)g_boot_cfg.perf, 0);
     SetEvent(g_worker_ready);
 
     MSG msg;
@@ -418,6 +505,7 @@ int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
     InitCommonControlsEx(&icc);
 
     cfg_resolve_path();
+    journal_resolve_path();
     cfg_load(&g_boot_cfg);
     ui_set_theme(g_boot_cfg.dark);
 
@@ -441,7 +529,9 @@ int WINAPI wWinMain(HINSTANCE inst, [[maybe_unused]] HINSTANCE prev,
 
     if (g_worker) PostMessageW(g_worker, WM_W_QUIT, 0, 0);
     if (g_worker_thread) {
-        WaitForSingleObject(g_worker_thread, 5000);
+        /* Long enough to restart an adapter: returning early would end the
+         * process between disabling it and enabling it again. */
+        WaitForSingleObject(g_worker_thread, 30000);
         CloseHandle(g_worker_thread);
     }
     if (g_worker_ready) CloseHandle(g_worker_ready);

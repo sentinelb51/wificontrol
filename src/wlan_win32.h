@@ -33,5 +33,6 @@ void          wcw_unregister(wc_win32 *w);
 
 void wcw_format_error(unsigned long code, wchar_t *buf, int cap);
 void wcw_guid_to_string(const wc_guid *g, wchar_t *buf, int cap);
+bool wcw_guid_from_string(const wchar_t *s, wc_guid *g);
 
 #endif

@@ -5,7 +5,8 @@
  * class-instance key, and we render exactly what it declares.
  *
  * Also the Wi-Fi Direct virtual adapters Windows layers on the same card,
- * which are devices of their own rather than properties.
+ * which are devices of their own rather than properties, and single-property
+ * access by adapter for the Performance switch.
  */
 #include "tune.h"
 #include "wlan_win32.h"
@@ -13,6 +14,7 @@
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <devguid.h>
+#include <regstr.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -22,9 +24,11 @@ static const wchar_t *CLASS_NET =
 /* One line on what a well-known property does: what changing it does to the
  * radio or the link, never which choice to make.  Keyed by registry keyword,
  * not ParamDesc, which the INF may translate.  Starred keywords are Microsoft's
- * standardized ones and mean the same on any vendor's card; the rest are the
+ * standardised ones and mean the same on any vendor's card; the rest are the
  * names Intel's driver uses.  A property not listed simply has no line. */
-static const struct { const wchar_t *keyword, *help; } KNOWN[] = {
+typedef struct { const wchar_t *keyword, *help; } known_prop;
+
+static const known_prop KNOWN[] = {
     { L"*PacketCoalescing",
       L"Batches received broadcast and multicast frames into fewer interrupts; they arrive later." },
     { L"*InterruptModeration",
@@ -39,25 +43,13 @@ static const struct { const wchar_t *keyword, *help; } KNOWN[] = {
       L"NDIS suspends the adapter after a few idle seconds; the next packet waits for it to resume." },
     { L"*DeviceSleepOnDisconnect",
       L"With no link, the adapter drops to low power (D3) and returns to full power on reconnect." },
-    { L"*PMARPOffload",
-      L"While the PC sleeps, the adapter answers IPv4 ARP requests itself instead of waking it." },
-    { L"*PMNSOffload",
-      L"While the PC sleeps, the adapter answers IPv6 neighbor solicitations itself instead of waking it." },
-    { L"*PMWiFiRekeyOffload",
-      L"While the PC sleeps, the adapter completes group key (GTK) rekeys itself to stay associated." },
-    { L"*WakeOnMagicPacket",
-      L"A magic packet (this adapter's MAC address repeated 16 times) wakes the PC from sleep." },
-    { L"*ModernStandbyWoLMagicPacket",
-      L"A magic packet wakes the PC from modern standby (S0ix); hibernation is not affected." },
-    { L"*WakeOnPattern",
-      L"Packets matching patterns Windows registers, such as an incoming TCP SYN, wake the PC." },
 
     { L"BgScanGlobalBlocking",
       L"Blocks background scans while connected: Never, only while the signal is good, or Always." },
     { L"RoamAggressiveness",
       L"Signal level at which the adapter starts scanning for a better AP; higher scans sooner." },
     { L"RoamingPreferredBandType",
-      L"Biases AP selection and roaming toward the chosen band; other bands stay usable." },
+      L"Biases AP selection and roaming towards the chosen band; other bands stay usable." },
     { L"ChannelWidth24",
       L"Auto follows the AP up to 40 MHz; 20 MHz only never bonds channels, capping peak rate." },
     { L"ChannelWidth52",
@@ -84,10 +76,26 @@ static const struct { const wchar_t *keyword, *help; } KNOWN[] = {
       L"Radio transmit power; lower shrinks range and the signal strength the AP receives." },
 };
 
-static const wchar_t *known_help(const wchar_t *keyword)
+/* The ones that act only while the PC sleeps, which the dialog keeps apart. */
+static const known_prop ASLEEP[] = {
+    { L"*PMARPOffload",
+      L"While the PC sleeps, the adapter answers IPv4 ARP requests itself instead of waking it." },
+    { L"*PMNSOffload",
+      L"While the PC sleeps, the adapter answers IPv6 neighbour solicitations itself instead of waking it." },
+    { L"*PMWiFiRekeyOffload",
+      L"While the PC sleeps, the adapter completes group key (GTK) rekeys itself to stay associated." },
+    { L"*WakeOnMagicPacket",
+      L"A magic packet (this adapter's MAC address repeated 16 times) wakes the PC from sleep." },
+    { L"*ModernStandbyWoLMagicPacket",
+      L"A magic packet wakes the PC from modern standby (S0ix); hibernation is not affected." },
+    { L"*WakeOnPattern",
+      L"Packets matching patterns Windows registers, such as an incoming TCP SYN, wake the PC." },
+};
+
+static const known_prop *known(const known_prop *table, size_t n, const wchar_t *keyword)
 {
-    for (size_t i = 0; i < sizeof KNOWN / sizeof KNOWN[0]; ++i)
-        if (_wcsicmp(KNOWN[i].keyword, keyword) == 0) return KNOWN[i].help;
+    for (size_t i = 0; i < n; ++i)
+        if (_wcsicmp(table[i].keyword, keyword) == 0) return &table[i];
     return nullptr;
 }
 
@@ -236,7 +244,10 @@ void tune_collect_driver(tune_list *l, const wc_guid *adapter)
         }
         wcsncpy(s->value_name, pname, TUNE_KEY_MAX - 1);
         s->value_name[TUNE_KEY_MAX - 1] = L'\0';
-        s->help = known_help(pname);
+        const known_prop *asleep = known(ASLEEP, sizeof ASLEEP / sizeof ASLEEP[0], pname);
+        const known_prop *kp = asleep ? asleep : known(KNOWN, sizeof KNOWN / sizeof KNOWN[0], pname);
+        s->help   = kp ? kp->help : nullptr;
+        s->asleep = asleep != nullptr;
 
         /* Live value, else the driver's declared default. */
         wchar_t live[TUNE_KEY_MAX] = L"";
@@ -255,42 +266,84 @@ void tune_collect_driver(tune_list *l, const wc_guid *adapter)
     RegCloseKey(params);
 }
 
-unsigned long tune_write_driver(const tune_list *l, const tune_setting *s)
+static unsigned long write_value(const wchar_t *instance_key, const wchar_t *name,
+                                 const wchar_t *raw)
 {
-    if (!l->have_instance) return ERROR_NOT_FOUND;
-
     HKEY inst;
-    LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, l->instance_key, 0,
+    LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, instance_key, 0,
                            KEY_QUERY_VALUE | KEY_SET_VALUE, &inst);
     if (r != ERROR_SUCCESS) return (unsigned long)r;
 
     /* Keep whatever type the driver already uses for this value. */
     DWORD existing = REG_SZ, ignored = 0;
-    RegQueryValueExW(inst, s->value_name, nullptr, &existing, nullptr, &ignored);
+    RegQueryValueExW(inst, name, nullptr, &existing, nullptr, &ignored);
 
-    const wchar_t *raw = s->opt[s->sel].raw;
     if (existing == REG_DWORD) {
         DWORD v = (DWORD)wcstoul(raw, nullptr, 10);
-        r = RegSetValueExW(inst, s->value_name, 0, REG_DWORD,
-                           (const BYTE *)&v, (DWORD)sizeof v);
+        r = RegSetValueExW(inst, name, 0, REG_DWORD, (const BYTE *)&v, (DWORD)sizeof v);
     } else {
-        r = RegSetValueExW(inst, s->value_name, 0, REG_SZ, (const BYTE *)raw,
+        r = RegSetValueExW(inst, name, 0, REG_SZ, (const BYTE *)raw,
                            (DWORD)((wcslen(raw) + 1) * sizeof(wchar_t)));
     }
     RegCloseKey(inst);
     return (unsigned long)r;
 }
 
+unsigned long tune_write_driver(const tune_list *l, const tune_setting *s)
+{
+    if (!l->have_instance) return ERROR_NOT_FOUND;
+    return write_value(l->instance_key, s->value_name, s->opt[s->sel].raw);
+}
+
+unsigned long tune_driver_get(const wc_guid *adapter, const wchar_t *keyword,
+                              const wchar_t *choice, wchar_t *live, int cap, bool *has_choice)
+{
+    wchar_t inst_key[MAX_PATH], param_key[MAX_PATH];
+    if (!find_instance(adapter, inst_key, MAX_PATH)) return ERROR_FILE_NOT_FOUND;
+    _snwprintf(param_key, MAX_PATH, L"%s\\Ndi\\Params\\%s", inst_key, keyword);
+    param_key[MAX_PATH - 1] = L'\0';
+
+    HKEY param;
+    LONG r = RegOpenKeyExW(HKEY_LOCAL_MACHINE, param_key, 0, KEY_READ, &param);
+    if (r != ERROR_SUCCESS) return (unsigned long)r;
+
+    /* Only a property with a list of choices has an Enum key. */
+    HKEY choices;
+    *has_choice = false;
+    if (RegOpenKeyExW(param, L"Enum", 0, KEY_READ, &choices) == ERROR_SUCCESS) {
+        *has_choice = RegQueryValueExW(choices, choice, nullptr, nullptr, nullptr, nullptr)
+                      == ERROR_SUCCESS;
+        RegCloseKey(choices);
+    }
+
+    /* Live value, else the driver's declared default. */
+    HKEY inst;
+    bool found = false;
+    live[0] = L'\0';
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, inst_key, 0, KEY_READ, &inst) == ERROR_SUCCESS) {
+        found = reg_value(inst, keyword, live, (DWORD)cap);
+        RegCloseKey(inst);
+    }
+    if (!found) reg_value(param, L"Default", live, (DWORD)cap);
+    RegCloseKey(param);
+    return ERROR_SUCCESS;
+}
+
+unsigned long tune_driver_set(const wc_guid *adapter, const wchar_t *keyword, const wchar_t *raw)
+{
+    wchar_t inst_key[MAX_PATH];
+    if (!find_instance(adapter, inst_key, MAX_PATH)) return ERROR_FILE_NOT_FOUND;
+    return write_value(inst_key, keyword, raw);
+}
+
 /* ---------------------------------------------------------------- devices */
 
-/* The card itself: the network device whose driver key is the class-instance
- * key tune_collect_driver resolved. */
-static bool find_card(const tune_list *l, HDEVINFO set, SP_DEVINFO_DATA *out)
+/* The card itself: the network device whose driver key is this class-instance
+ * key. */
+static bool find_card(const wchar_t *instance_key, HDEVINFO set, SP_DEVINFO_DATA *out)
 {
-    if (!l->have_instance) return false;
-
     /* The instance key path ends in the four digits SPDRP_DRIVER reports. */
-    const wchar_t *slash = wcsrchr(l->instance_key, L'\\');
+    const wchar_t *slash = wcsrchr(instance_key, L'\\');
     if (!slash) return false;
     wchar_t want[64];
     _snwprintf(want, 64, L"{4D36E972-E325-11CE-BFC1-08002BE10318}\\%s", slash + 1);
@@ -323,14 +376,14 @@ static bool set_state(HDEVINFO set, SP_DEVINFO_DATA *dev, DWORD change)
 
 /* Disable then re-enable the device so the miniport re-reads its parameters.
  * Same thing Device Manager does when you press OK on the Advanced tab. */
-unsigned long tune_restart_adapter(const tune_list *l)
+static unsigned long restart_card(const wchar_t *instance_key)
 {
     HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr, DIGCF_PRESENT);
     if (set == INVALID_HANDLE_VALUE) return GetLastError();
 
     unsigned long result = ERROR_NOT_FOUND;
     SP_DEVINFO_DATA dev = { .cbSize = sizeof dev };
-    if (find_card(l, set, &dev)) {
+    if (find_card(instance_key, set, &dev)) {
         if (!set_state(set, &dev, DICS_DISABLE))     result = GetLastError();
         else if (!set_state(set, &dev, DICS_ENABLE)) result = GetLastError(); /* left disabled: the caller must report this */
         else                                         result = ERROR_SUCCESS;
@@ -339,26 +392,63 @@ unsigned long tune_restart_adapter(const tune_list *l)
     return result;
 }
 
+unsigned long tune_restart_adapter(const tune_list *l)
+{
+    return l->have_instance ? restart_card(l->instance_key) : ERROR_NOT_FOUND;
+}
+
+unsigned long tune_driver_restart(const wc_guid *adapter)
+{
+    wchar_t inst_key[MAX_PATH];
+    if (!find_instance(adapter, inst_key, MAX_PATH)) return ERROR_FILE_NOT_FOUND;
+    return restart_card(inst_key);
+}
+
 /* ----------------------------------------------------------- Wi-Fi Direct */
 
 /* The virtual adapters from vwifimp.inf: one for Wi-Fi Direct and Miracast,
  * one for Mobile Hotspot.  Matched by parent too, so a second card's are
  * never touched. */
 static const wchar_t WFD_HWID[] = L"{5d624f94-8850-40c3-a3fa-a4fd2080baf3}\\vwifimp_wfd";
+enum { WFD_MAX = 8 };
 
-/* Count this card's Wi-Fi Direct adapters and how many are disabled, first
- * moving each one to `change` when it is nonzero. */
-static unsigned long wfd_walk(const tune_list *l, DWORD change, int *total, int *disabled)
+typedef struct { SP_DEVINFO_DATA dev; wchar_t id[MAX_DEVICE_ID_LEN]; } wfd_dev;
+
+static int by_id(const void *a, const void *b)
 {
-    *total = *disabled = 0;
+    return _wcsicmp(((const wfd_dev *)a)->id, ((const wfd_dev *)b)->id);
+}
+
+/* Disabled now, or from the next restart: the stored choice is what counts. */
+static bool dev_disabled(HDEVINFO set, SP_DEVINFO_DATA *dev)
+{
+    DWORD flags = 0;
+    ULONG status = 0, problem = 0;
+    if (SetupDiGetDeviceRegistryPropertyW(set, dev, SPDRP_CONFIGFLAGS, nullptr, (BYTE *)&flags,
+                                          sizeof flags, nullptr) &&
+        (flags & CONFIGFLAG_DISABLED))
+        return true;
+    return CM_Get_DevNode_Status(&status, &problem, dev->DevInst, 0) == CR_SUCCESS &&
+           (status & DN_HAS_PROBLEM) && problem == CM_PROB_DISABLED;
+}
+
+/* This card's Wi-Fi Direct adapters in instance ID order, so a list of their
+ * states means the same thing next time.  `state` gets a '1' (enabled) or '0'
+ * (disabled) for each, and an empty string when the card has none.  With
+ * `want`, each adapter is first moved to its character there, an adapter past
+ * the end taking the last one. */
+static unsigned long wfd_walk(const wchar_t *instance_key, const char *want, char *state, int cap)
+{
+    state[0] = '\0';
     HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, nullptr, nullptr, DIGCF_PRESENT);
     if (set == INVALID_HANDLE_VALUE) return GetLastError();
 
     SP_DEVINFO_DATA card = { .cbSize = sizeof card }, dev = { .cbSize = sizeof dev };
-    unsigned long result = find_card(l, set, &card) ? ERROR_SUCCESS : ERROR_NOT_FOUND;
-    bool reboot = false;
+    unsigned long result = find_card(instance_key, set, &card) ? ERROR_SUCCESS : ERROR_NOT_FOUND;
+    wfd_dev found[WFD_MAX];
+    int n = 0;
 
-    for (DWORD i = 0; result == ERROR_SUCCESS && SetupDiEnumDeviceInfo(set, i, &dev); ++i) {
+    for (DWORD i = 0; result == ERROR_SUCCESS && n < WFD_MAX && SetupDiEnumDeviceInfo(set, i, &dev); ++i) {
         /* A multi-string: the first entry is the one to match.  Two characters
          * short, so it always ends in a double terminator. */
         wchar_t hwid[256] = L"";
@@ -368,31 +458,63 @@ static unsigned long wfd_walk(const tune_list *l, DWORD change, int *total, int 
             _wcsicmp(hwid, WFD_HWID) != 0 ||
             CM_Get_Parent(&parent, dev.DevInst, 0) != CR_SUCCESS || parent != card.DevInst)
             continue;
+        found[n].dev = dev;
+        if (!SetupDiGetDeviceInstanceIdW(set, &dev, found[n].id, MAX_DEVICE_ID_LEN, nullptr))
+            found[n].id[0] = L'\0';
+        n++;
+    }
+    qsort(found, (size_t)n, sizeof *found, by_id);
 
-        if (change) {
-            if (!set_state(set, &dev, change)) { result = GetLastError(); break; }
+    const size_t len = want ? strlen(want) : 0;
+    bool reboot = false;
+    for (int k = 0; result == ERROR_SUCCESS && k < n; ++k) {
+        bool off = dev_disabled(set, &found[k].dev);
+        if (len && (want[(size_t)k < len ? (size_t)k : len - 1] == '0') != off) {
+            if (!set_state(set, &found[k].dev, off ? DICS_ENABLE : DICS_DISABLE)) {
+                result = GetLastError();
+                break;
+            }
             SP_DEVINSTALL_PARAMS_W ip = { .cbSize = sizeof ip };
-            if (SetupDiGetDeviceInstallParamsW(set, &dev, &ip) &&
+            if (SetupDiGetDeviceInstallParamsW(set, &found[k].dev, &ip) &&
                 (ip.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART)))
                 reboot = true;
+            off = dev_disabled(set, &found[k].dev);
         }
-
-        ULONG status = 0, problem = 0;
-        (*total)++;
-        if (CM_Get_DevNode_Status(&status, &problem, dev.DevInst, 0) == CR_SUCCESS &&
-            (status & DN_HAS_PROBLEM) && problem == CM_PROB_DISABLED)
-            (*disabled)++;
+        if (k < cap - 1) {
+            state[k]     = off ? '0' : '1';
+            state[k + 1] = '\0';
+        }
     }
     SetupDiDestroyDeviceInfoList(set);
     return (result == ERROR_SUCCESS && reboot) ? ERROR_SUCCESS_REBOOT_REQUIRED : result;
 }
 
+unsigned long tune_wfd_get(const wc_guid *adapter, char *state, int cap)
+{
+    wchar_t inst_key[MAX_PATH];
+    state[0] = '\0';
+    if (!find_instance(adapter, inst_key, MAX_PATH)) return ERROR_FILE_NOT_FOUND;
+    return wfd_walk(inst_key, nullptr, state, cap);
+}
+
+unsigned long tune_wfd_set(const wc_guid *adapter, const char *state)
+{
+    wchar_t inst_key[MAX_PATH];
+    char after[WFD_MAX + 1];
+    if (!state[0]) return ERROR_INVALID_PARAMETER;
+    if (!find_instance(adapter, inst_key, MAX_PATH)) return ERROR_FILE_NOT_FOUND;
+    return wfd_walk(inst_key, state, after, sizeof after);
+}
+
 void tune_collect_wfd(tune_list *l)
 {
-    int total = 0, disabled = 0;
-    if (l->n >= TUNE_MAX_SETTINGS || wfd_walk(l, 0, &total, &disabled) != ERROR_SUCCESS ||
-        total == 0)
+    char state[WFD_MAX + 1];
+    if (l->n >= TUNE_MAX_SETTINGS || !l->have_instance ||
+        wfd_walk(l->instance_key, nullptr, state, sizeof state) != ERROR_SUCCESS || !state[0])
         return;
+    const int total = (int)strlen(state);
+    int disabled = 0;
+    for (int k = 0; k < total; ++k) disabled += state[k] == '0';
 
     tune_setting *s = &l->s[l->n];
     memset(s, 0, sizeof *s);
@@ -417,7 +539,9 @@ void tune_collect_wfd(tune_list *l)
 
 unsigned long tune_write_wfd(const tune_list *l, const tune_setting *s)
 {
-    int total = 0, disabled = 0;
-    unsigned long e = wfd_walk(l, (DWORD)s->opt[s->sel].index, &total, &disabled);
-    return (e == ERROR_SUCCESS && total == 0) ? ERROR_NOT_FOUND : e;
+    char state[WFD_MAX + 1];
+    if (!l->have_instance) return ERROR_NOT_FOUND;
+    unsigned long e = wfd_walk(l->instance_key, s->opt[s->sel].index == DICS_DISABLE ? "0" : "1",
+                               state, sizeof state);
+    return (e == ERROR_SUCCESS && !state[0]) ? ERROR_NOT_FOUND : e;
 }

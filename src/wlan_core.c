@@ -18,7 +18,7 @@ void wc_init(wc_state *s, const wc_backend *be)
 {
     memset(s, 0, sizeof *s);
     s->be = *be;
-    s->enabled = true;
+    s->bgscan_off = s->streaming_on = true;
     /* Assume we may write until the probe says otherwise; a failed probe must
      * never stop us from trying, because the probe is only advisory. */
     for (int o = 0; o < WC_OPT_COUNT; ++o) s->can_write[o] = true;
@@ -33,13 +33,18 @@ void wc_probe_access(wc_state *s)
     }
 }
 
+static bool voted(const wc_adapter *a)
+{
+    return a->voted[WC_OPT_STREAMING] || a->voted[WC_OPT_BGSCAN];
+}
+
 /* Reuse the slot of an adapter that is gone, so a machine that cycles through
  * USB dongles cannot wedge the table. */
 static int alloc_slot(wc_state *s)
 {
     if (s->n < WC_MAX_ADAPTERS) return s->n++;
     for (int i = 0; i < s->n; ++i)
-        if (!s->ad[i].present && !s->ad[i].touched) return i;
+        if (!s->ad[i].present && !voted(&s->ad[i])) return i;
     return -1;
 }
 
@@ -81,26 +86,34 @@ unsigned long wc_refresh(wc_state *s)
 
 /* Read, compare, write only on mismatch, then verify.  Both the comparison and
  * the verification normalise to 0/1: the API documents any nonzero as TRUE, so
- * a driver answering 0xFFFFFFFF must not read as a failure. */
-static void apply_opcode(wc_state *s, wc_adapter *a, wc_opt o, int desired, wc_val *slot)
+ * a driver answering 0xFFFFFFFF must not read as a failure.
+ *
+ * `want` asks for streaming on or background scan off.  Otherwise the default
+ * is written, but only to withdraw a request of ours: a value we never asked
+ * for is another client's, and it may well read back unchanged. */
+static void apply_opcode(wc_state *s, wc_adapter *a, wc_opt o, bool want, wc_val *slot)
 {
+    const int desired = (o == WC_OPT_STREAMING) == want;
+
     int cur = 0;
     unsigned long e = s->be.query_bool(s->be.ctx, &a->guid, o, &cur);
     if (e != WC_OK) { *slot = WC_VAL_UNKNOWN; if (!a->last_err) a->last_err = e; return; }
 
     cur   = !!cur;
     *slot = cur ? WC_VAL_ON : WC_VAL_OFF;
-    if (cur == desired) return;
+    if (!want && !a->voted[o]) return;
+    if (cur == desired) { a->voted[o] = want; return; }
 
     e = s->be.set_bool(s->be.ctx, &a->guid, o, desired);
     if (e != WC_OK) { if (!a->last_err) a->last_err = e; return; }
+    a->voted[o] = want;
 
     e = s->be.query_bool(s->be.ctx, &a->guid, o, &cur);
     if (e != WC_OK) { *slot = WC_VAL_UNKNOWN; if (!a->last_err) a->last_err = e; return; }
 
     cur   = !!cur;
     *slot = cur ? WC_VAL_ON : WC_VAL_OFF;
-    if (cur != desired && !a->last_err) a->last_err = WC_E_VERIFY;
+    if (want && cur != desired && !a->last_err) a->last_err = WC_E_VERIFY;
 }
 
 /* Auto config is forced back on unless every condition for keeping it off
@@ -113,8 +126,7 @@ static void apply_opcode(wc_state *s, wc_adapter *a, wc_opt o, int desired, wc_v
  * is what makes recovery on a dropped link possible at all. */
 static void apply_autoconf(wc_state *s, wc_adapter *a)
 {
-    const bool keep_off = s->enabled && s->nuclear && a->managed &&
-                          a->state == WC_IF_CONNECTED;
+    const bool keep_off = s->nuclear && a->managed && a->state == WC_IF_CONNECTED;
 
     int cur = 0;
     unsigned long e = s->be.query_bool(s->be.ctx, &a->guid, WC_OPT_AUTOCONF, &cur);
@@ -140,7 +152,7 @@ static void apply_autoconf(wc_state *s, wc_adapter *a)
  * before the first packet of its next connection. */
 static void apply_metered(wc_state *s, wc_adapter *a)
 {
-    const bool want = s->enabled && s->metered && a->managed;
+    const bool want = s->metered && a->managed;
 
     /* A clean pass found nothing of ours and nothing is wanted: skip the
      * per-profile reads until something changes that. */
@@ -183,7 +195,9 @@ void wc_apply_one(wc_state *s, int i)
     wc_adapter *a = &s->ad[i];
     if (!a->present) return;
 
-    const bool want = s->enabled && a->managed;
+    const bool stream = s->streaming_on && a->managed;
+    const bool quiet  = s->bgscan_off && a->managed;
+    const bool want   = stream || quiet;
 
     /* Cleared once, here, so that an auto config failure below survives every
      * early return.  apply_opcode keeps the first error rather than the last. */
@@ -196,7 +210,7 @@ void wc_apply_one(wc_state *s, int i)
     apply_metered(s, a);
 
     /* Nothing to do and nothing to undo. */
-    if (!want && !a->touched) {
+    if (!want && !voted(a)) {
         a->pending   = false;
         a->streaming = a->bgscan = WC_VAL_UNKNOWN;
         return;
@@ -206,13 +220,14 @@ void wc_apply_one(wc_state *s, int i)
      * disconnect anyway.  This is the documented contract, not a failure. */
     if (a->state != WC_IF_CONNECTED) {
         a->pending   = want;
-        a->touched   = false; /* the disconnect already dropped our request */
+        /* the disconnect already dropped our requests */
+        a->voted[WC_OPT_STREAMING] = a->voted[WC_OPT_BGSCAN] = false;
         a->streaming = a->bgscan = WC_VAL_UNKNOWN;
         return;
     }
 
-    apply_opcode(s, a, WC_OPT_STREAMING, want ? 1 : 0, &a->streaming);
-    apply_opcode(s, a, WC_OPT_BGSCAN,    want ? 0 : 1, &a->bgscan);
+    apply_opcode(s, a, WC_OPT_STREAMING, stream, &a->streaming);
+    apply_opcode(s, a, WC_OPT_BGSCAN,    quiet,  &a->bgscan);
 
     /* Lost the race with a disconnect between enumerate and set. */
     if (a->last_err == WC_E_INVALID_STATE) {
@@ -222,7 +237,6 @@ void wc_apply_one(wc_state *s, int i)
     }
 
     a->pending = false;
-    a->touched = want;
     if (a->last_err) a->consec_fail++;
     else             a->consec_fail = 0;
 }
@@ -241,9 +255,15 @@ unsigned long wc_poll(wc_state *s)
     return WC_OK;
 }
 
-void wc_set_enabled(wc_state *s, bool on)
+void wc_set_bgscan_off(wc_state *s, bool on)
 {
-    s->enabled = on;
+    s->bgscan_off = on;
+    wc_apply_all(s);
+}
+
+void wc_set_streaming_on(wc_state *s, bool on)
+{
+    s->streaming_on = on;
     wc_apply_all(s);
 }
 

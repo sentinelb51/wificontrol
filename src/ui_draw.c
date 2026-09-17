@@ -243,6 +243,14 @@ static double sd_ring(double x, double y, const double *k)
     return d > in ? d : in;
 }
 
+/* k: as sd_rrect, then the band's left and right edge */
+static double sd_band(double x, double y, const double *k)
+{
+    double d = sd_rrect(x, y, k);
+    double b = k[5] - x > x - k[6] ? k[5] - x : x - k[6];
+    return d > b ? d : b;
+}
+
 /* k: x0, y0, x1, y1, half width */
 static double sd_line(double x, double y, const double *k)
 {
@@ -269,6 +277,16 @@ void ui_rrect(ui_canvas *c, double x0, double y0, double x1, double y1, double r
     double k[5];
     rrect_k(k, x0, y0, x1, y1, r);
     shade(c, x0, y0, x1, y1, sd_rrect, k, col);
+}
+
+void ui_rrect_band(ui_canvas *c, double x0, double y0, double x1, double y1, double r,
+                   double from, double to, COLORREF col)
+{
+    double k[7];
+    rrect_k(k, x0, y0, x1, y1, r);
+    k[5] = from;
+    k[6] = to;
+    shade(c, from, y0, to, y1, sd_band, k, col);
 }
 
 void ui_ring(ui_canvas *c, double x0, double y0, double x1, double y1, double r,

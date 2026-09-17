@@ -38,10 +38,11 @@ typedef enum {
     WC_IF_AUTHENTICATING
 } wc_ifstate;
 
-/* STREAMING and BGSCAN are reference-counted by the OS across client handles
- * and are reset automatically when the adapter disconnects, so "restoring"
- * them means writing the opposite value (which withdraws this process's vote)
- * or closing the handle.
+/* STREAMING and BGSCAN are votes: streaming mode is on while any client asks
+ * for it, background scan off while any client asks for that.  The OS resets
+ * both when the adapter disconnects, so "restoring" them means writing the
+ * default back (which withdraws this process's vote) or closing the handle.
+ * Another client's vote can keep either one where it is.
  *
  * AUTOCONF is not like that at all.  Nothing refcounts it, nothing resets it
  * on disconnect, and it survives the process -- the docs call it equivalent to
@@ -96,9 +97,9 @@ typedef struct {
     char          name[WC_NAME_MAX];
     wc_ifstate    state;
     bool          present;      /* seen in the most recent enumeration */
-    bool          managed;      /* user wants this adapter optimized */
-    bool          touched;      /* we have an outstanding request on it */
-    bool          pending;      /* wants optimizing but is not connected yet */
+    bool          managed;      /* user wants this adapter optimised */
+    bool          voted[2];     /* a request of ours is outstanding: streaming, bgscan */
+    bool          pending;      /* wants optimising but is not connected yet */
     wc_val        streaming;    /* last value read back */
     wc_val        bgscan;
     wc_val        autoconf;
@@ -110,8 +111,9 @@ typedef struct {
 
 typedef struct {
     wc_backend    be;
-    bool          enabled;                 /* master switch */
-    bool          nuclear;                 /* also disable WLAN auto config */
+    bool          bgscan_off;              /* ask for background scan off */
+    bool          streaming_on;            /* ask for media streaming mode */
+    bool          nuclear;                 /* disable WLAN auto config: no scans at all */
     bool          metered;                 /* give every saved profile a metered cost */
     int           recovered;               /* adapters we forced auto config back on */
     wc_adapter    ad[WC_MAX_ADAPTERS];
@@ -120,17 +122,18 @@ typedef struct {
     unsigned long enum_err;
 } wc_state;
 
-void          wc_init        (wc_state *s, const wc_backend *be);
-void          wc_probe_access(wc_state *s);
-unsigned long wc_refresh     (wc_state *s);          /* enumerate, merge, keep user flags */
-void          wc_apply_all   (wc_state *s);
-void          wc_apply_one   (wc_state *s, int i);
-unsigned long wc_poll        (wc_state *s);          /* refresh + apply_all */
-void          wc_set_enabled (wc_state *s, bool on);
-void          wc_set_nuclear (wc_state *s, bool on);
-void          wc_set_metered (wc_state *s, bool on);
-void          wc_set_managed (wc_state *s, int i, bool on);
-int           wc_find        (const wc_state *s, const wc_guid *g); /* -1 if absent */
+void          wc_init            (wc_state *s, const wc_backend *be);
+void          wc_probe_access    (wc_state *s);
+unsigned long wc_refresh         (wc_state *s);      /* enumerate, merge, keep user flags */
+void          wc_apply_all       (wc_state *s);
+void          wc_apply_one       (wc_state *s, int i);
+unsigned long wc_poll            (wc_state *s);      /* refresh + apply_all */
+void          wc_set_bgscan_off  (wc_state *s, bool on);
+void          wc_set_streaming_on(wc_state *s, bool on);
+void          wc_set_nuclear     (wc_state *s, bool on);
+void          wc_set_metered     (wc_state *s, bool on);
+void          wc_set_managed     (wc_state *s, int i, bool on);
+int           wc_find            (const wc_state *s, const wc_guid *g); /* -1 if absent */
 
 /* True once any adapter has reported ERROR_ACCESS_DENIED, or the advisory
  * probe says we lack write access.  The app manifest already demands

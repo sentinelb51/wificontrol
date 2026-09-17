@@ -21,6 +21,7 @@ typedef struct {
     long          raw_true;             /* what this "driver" calls TRUE */
     unsigned long q_err, s_err;
     bool          stick;                /* false: set succeeds but nothing changes */
+    bool          other[4][WC_OPT_COUNT]; /* another client asks for the non-default */
     int           nq, ns;               /* call counts */
     int           nset[4];              /* writes per adapter */
     bool          can_write[WC_OPT_COUNT];
@@ -65,6 +66,9 @@ static unsigned long f_set(void *ctx, const wc_guid *g, wc_opt o, int v)
     int i = fake_index(f, g);
     if (i < 0) return WC_E_BADDATA;
     f->nset[i]++;
+    /* Streaming defaults to off, background scan to on. */
+    const int dflt = (o != WC_OPT_STREAMING);
+    if (f->other[i][o] && !!v == dflt) return WC_OK;   /* outvoted */
     if (f->stick) f->val[i][o] = v ? f->raw_true : 0;
     return WC_OK;
 }
@@ -205,7 +209,7 @@ static void t_invalid_state_race(void)
 static void t_transient_error_does_not_stop_us(void)
 {
     /* WLANOptimizerThread::Loop breaks out of the loop on any unexpected
-     * failure, so one hiccup silently disables the optimizer for good. */
+     * failure, so one hiccup silently disables the optimiser for good. */
     printf("recovers after a transient failure\n");
     fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
 
@@ -238,17 +242,69 @@ static void t_disable_withdraws_request(void)
     fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
 
     wc_poll(&s);
-    CHECK(s.ad[0].touched);
+    CHECK(s.ad[0].voted[WC_OPT_STREAMING] && s.ad[0].voted[WC_OPT_BGSCAN]);
 
-    wc_set_enabled(&s, false);
+    wc_set_streaming_on(&s, false);
     CHECK(f.val[0][WC_OPT_STREAMING] == 0);
+    CHECK(f.val[0][WC_OPT_BGSCAN]    == 0);   /* the other switch still holds */
+    CHECK(!s.ad[0].voted[WC_OPT_STREAMING]);
+
+    wc_set_bgscan_off(&s, false);
     CHECK(f.val[0][WC_OPT_BGSCAN]    == 1);
-    CHECK(!s.ad[0].touched);
+    CHECK(!s.ad[0].voted[WC_OPT_BGSCAN]);
+    CHECK(f.ns == 4);
 
     int writes = f.ns;
     wc_poll(&s);
     wc_poll(&s);
     CHECK(f.ns == writes); /* nothing left to undo */
+}
+
+static void t_switches_are_independent(void)
+{
+    printf("each switch writes only its own opcode\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    s.streaming_on = false;
+
+    wc_poll(&s);
+    CHECK(f.val[0][WC_OPT_BGSCAN] == 0);
+    CHECK(f.val[0][WC_OPT_STREAMING] == 0);
+    CHECK(s.ad[0].streaming == WC_VAL_OFF);   /* still read, for the card */
+    CHECK(f.ns == 1);
+
+    wc_set_bgscan_off(&s, false);
+    wc_set_streaming_on(&s, true);
+    CHECK(f.val[0][WC_OPT_BGSCAN] == 1);
+    CHECK(f.val[0][WC_OPT_STREAMING] == 1);
+    CHECK(f.ns == 3);
+    CHECK(s.ad[0].last_err == WC_OK);
+}
+
+static void t_another_clients_vote_is_theirs(void)
+{
+    /* Streaming mode stays on while any client asks for it, so neither
+     * leaving it alone nor withdrawing our own request may fight that. */
+    printf("a value another client holds is neither written nor an error\n");
+    fake f; wc_state s; fake_init(&f, 1); bind(&s, &f);
+    f.other[0][WC_OPT_STREAMING] = true;
+    f.val[0][WC_OPT_STREAMING] = 1;
+    s.streaming_on = false;
+
+    wc_poll(&s);
+    CHECK(f.ns == 1);                         /* background scan only */
+    CHECK(s.ad[0].last_err == WC_OK);
+    CHECK(s.ad[0].streaming == WC_VAL_ON);
+
+    /* Asked for and then withdrawn: the write goes out once, reads back on,
+     * and is not retried. */
+    wc_set_streaming_on(&s, true);
+    CHECK(s.ad[0].voted[WC_OPT_STREAMING]);
+    wc_set_streaming_on(&s, false);
+    CHECK(s.ad[0].last_err == WC_OK);
+    CHECK(!s.ad[0].voted[WC_OPT_STREAMING]);
+    const int writes = f.ns;
+    wc_poll(&s);
+    CHECK(f.ns == writes);
 }
 
 static void t_unmanaged_is_never_written(void)
@@ -349,9 +405,9 @@ static void t_disconnect_restores_autoconf(void)
     CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
 }
 
-static void t_disarm_and_master_off_restore(void)
+static void t_disarm_restores(void)
 {
-    printf("disarming, and the master switch, both restore auto config\n");
+    printf("disarming restores auto config, whatever the other switches say\n");
     fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
 
     wc_poll(&s);
@@ -363,9 +419,12 @@ static void t_disarm_and_master_off_restore(void)
     CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);
     CHECK(f.val[1][WC_OPT_AUTOCONF] == 1);
 
+    /* It needs neither of the other two. */
+    wc_set_bgscan_off(&s, false);
+    wc_set_streaming_on(&s, false);
     wc_set_nuclear(&s, true);
     CHECK(f.val[0][WC_OPT_AUTOCONF] == 0);
-    wc_set_enabled(&s, false);               /* master off overrides the arm */
+    wc_set_nuclear(&s, false);
     CHECK(f.val[0][WC_OPT_AUTOCONF] == 1);
 }
 
@@ -452,7 +511,7 @@ static void t_metered_repairs_only_its_own_cost(void)
 
 static void t_metered_released_by_every_switch(void)
 {
-    printf("switching off, the master switch and unmanaging all reset the cost\n");
+    printf("switching off and unmanaging reset the cost; the other switches do not\n");
     fake f; wc_state s; fake_init(&f, 2); bind(&s, &f);
     f.nprof[0] = f.nprof[1] = 1;
 
@@ -466,11 +525,11 @@ static void t_metered_released_by_every_switch(void)
     CHECK(f.cost[1][0] == COST_UNRESTRICTED);
 
     wc_set_metered(&s, true);
-    wc_set_enabled(&s, false);
-    CHECK(f.cost[0][0] == COST_UNRESTRICTED);
-    CHECK(f.cost[1][0] == COST_UNRESTRICTED);
+    wc_set_bgscan_off(&s, false);
+    wc_set_streaming_on(&s, false);
+    CHECK(f.cost[0][0] == WC_COST_VARIABLE);
+    CHECK(f.cost[1][0] == WC_COST_VARIABLE);
 
-    wc_set_enabled(&s, true);
     wc_set_managed(&s, 1, false);
     CHECK(f.cost[0][0] == WC_COST_VARIABLE);
     CHECK(f.cost[1][0] == COST_UNRESTRICTED);
@@ -505,6 +564,8 @@ int main(void)
     t_transient_error_does_not_stop_us();
     t_verify_mismatch();
     t_disable_withdraws_request();
+    t_switches_are_independent();
+    t_another_clients_vote_is_theirs();
     t_unmanaged_is_never_written();
     t_managed_flag_survives_unplug();
     t_access_denied_flags_elevation();
@@ -512,7 +573,7 @@ int main(void)
     t_nuclear_disables_autoconf();
     t_startup_repairs_a_previous_crash();
     t_disconnect_restores_autoconf();
-    t_disarm_and_master_off_restore();
+    t_disarm_restores();
     t_unmanaged_keeps_autoconf();
     t_autoconf_error_is_not_swallowed();
     t_metered_marks_every_profile();

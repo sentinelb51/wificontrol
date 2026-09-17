@@ -334,3 +334,18 @@ void wcw_guid_to_string(const wc_guid *g, wchar_t *buf, int cap)
                id.Data4[4], id.Data4[5], id.Data4[6], id.Data4[7]);
     buf[cap - 1] = L'\0';
 }
+
+bool wcw_guid_from_string(const wchar_t *s, wc_guid *g)
+{
+    unsigned int d1, d2, d3, b[8];
+    if (swscanf(s, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7]) != 11)
+        return false;
+    GUID out;
+    out.Data1 = (unsigned long)d1;
+    out.Data2 = (unsigned short)d2;
+    out.Data3 = (unsigned short)d3;
+    for (int i = 0; i < 8; ++i) out.Data4[i] = (unsigned char)b[i];
+    memcpy(g->b, &out, sizeof g->b);
+    return true;
+}

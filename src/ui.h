@@ -44,6 +44,9 @@ bool ui_canvas_begin(ui_canvas *c, HDC ref, int w, int h);
 void ui_canvas_end  (ui_canvas *c, HDC dst, int x, int y);
 void ui_fill (ui_canvas *c, int x0, int y0, int x1, int y1, COLORREF col);
 void ui_rrect(ui_canvas *c, double x0, double y0, double x1, double y1, double r, COLORREF col);
+/* Only the slice of that rounded rectangle between x = from and x = to: an edge stripe. */
+void ui_rrect_band(ui_canvas *c, double x0, double y0, double x1, double y1, double r,
+                   double from, double to, COLORREF col);
 void ui_frame(ui_canvas *c, double x0, double y0, double x1, double y1, double r,
               double t, COLORREF edge, COLORREF fill);
 void ui_ring (ui_canvas *c, double x0, double y0, double x1, double y1, double r,

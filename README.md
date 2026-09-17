@@ -1,300 +1,104 @@
-# wificontrol
+# Introduction
 
-A small Windows tray utility that does what [WLANOptimizer][orig] does — ask the
-Wi-Fi driver to stop scanning for other access points while you are connected —
-without the bugs, and with a UI that tells you whether it actually worked.
+### Purpose
+WiFi Control is a Windows tray utility that stops your Wi-Fi driver from scanning for other access points while you're connected.
+Those scans are what cause the periodic latency spikes in games and calls.
 
-Single 100 KB executable. No installer, no service, no runtime, no dependencies
-beyond what ships with Windows. Every push to `main` replaces it on the
-[latest release](https://github.com/sentinelb51/wificontrol/releases/latest).
+### Context
+It does what [WLANOptimizer](https://github.com/catid/WLANOptimizer) does, minus the bugs. WLANOptimizer leaks memory on every poll,
+dies silently on the first unexpected error, leaves up to 11 seconds of scanning after every reconnect, and never tells you
+whether any of it worked. This one re-applies within ~250 ms of a reconnect and shows you what the driver reported back.
 
-[orig]: https://github.com/catid/WLANOptimizer
+### Platforms
+Windows only, x64. It has only been tested on Windows 11.
 
-## What it changes
+One ~130 KB executable; no installer, no service, no runtime, nothing beyond what ships with Windows.
 
-Two per-adapter settings, through `WlanSetInterface`:
+### Disclaimer
+Whether it measurably helps depends on your driver; some ignore the streaming-mode hint entirely.
+The cards show what the driver reported back, not what the app asked for.
 
-| Setting | Value | Effect |
-| --- | --- | --- |
-| `wlan_intf_opcode_background_scan_enabled` | off | stops periodic scans for other APs while associated |
-| `wlan_intf_opcode_media_streaming_mode` | on | hints to the driver that latency matters more than power |
+# Features
 
-Both are reference-counted per client handle and both are reset by Windows the
-moment the adapter disconnects. Nothing is written to the registry, nothing
-survives a reboot, and **closing this app hands both settings straight back to
-Windows** — including if it crashes or is killed. That is the safety model, not
-an afterthought.
+### Latency
+- **No background scans, and streaming mode**; two switches, set per adapter through `WlanSetInterface`
+- **Re-applied within ~250 ms of a reconnect**; driven by connection events, with a 60-second watchdog and a re-apply on resume from sleep
+- **Never blocks the UI**; the slow (~1 second) driver call runs on its own worker thread
+- **Honest status**; each card shows what the driver actually reported, and failures are counted and retried instead of silently stopping
 
-Whether they measurably help depends on your driver. Some modern drivers ignore
-the streaming-mode hint entirely. The Status column tells you what the driver
-actually reported back, rather than assuming the write took.
+### Safety
+- **Nothing gets stuck**; Windows resets the two base settings the moment the app exits, even if it crashes or is killed
+- **The other switches undo themselves**; when switched off, on exit, and on the next start if a previous run was killed
+- **No location prompt, ever**; the app never calls the Wi-Fi APIs that need location consent, so the location icon stays off
+- **Access denied is explained**; if a write is refused even as administrator, it says so and names the likely cause
 
-## What is fixed relative to the original
+### Switches
+Independent of each other; each applies to every adapter whose card has **Manage** on.
+- **No background scans** (on by default); Windows stops its once-a-minute scan for other networks while you're connected.
+  Scans you or other apps ask for, such as opening the Wi-Fi list, still happen
+- **Streaming mode** (on by default); tells the driver latency matters more than power. Some drivers ignore it
+- **Block all scans** (off by default); turns off Wi-Fi auto configuration, which also blocks the scans you or other apps ask for. **No roaming and no automatic reconnect** while it's on.
+  It asks first, starts off every time, and gives scanning back when the link drops, when the timer runs out (15 minutes by default), and on exit.
+  If the app is killed outright, scanning stays off until you start it again
+- **Metered** (on by default); marks your saved Wi-Fi networks as pay-per-byte, so Windows Update, Delivery Optimization, OneDrive and the Store stop downloading in the background.
+  It overrides any network you marked as metered yourself
+- **Performance** (off by default); turns off power saving on the Wi-Fi path: MIMO power save, U-APSD, selective suspend and PCIe link state power management, with transmit power and the power plan's Wi-Fi setting at maximum.
+  It also disables the Wi-Fi Direct adapters, so Miracast, Mobile Hotspot and Wi-Fi Direct stop working.
+  The adapter restarts to apply it (Wi-Fi drops for a few seconds), and battery life suffers. The old values are saved first and put back when you're done
 
-Line references are to `WLANOptimizer.cpp` in the upstream project.
+### Tuning
+- **Driver advanced properties**; read from the driver itself, so you get whatever your card exposes, under the names it gives them
+- **Wi-Fi power settings**; adapter power saving mode and PCIe link state power management, plugged in and on battery
+- **Wi-Fi Direct toggle**; one dropdown that disables the virtual adapters behind Miracast, Mobile Hotspot and Wi-Fi Direct
+- **One-line notes**; what well-known settings do to the radio or the link, never which value to pick
+- **Nothing automatic**; you pick, you press Apply, and only what you changed gets written
 
-- **Leaked memory on every poll.** `WlanQueryInterface` allocates, and the
-  caller must release it with `WlanFreeMemory`. The original never does, on
-  either query path (`:69`, `:119`), so it leaks twice per opcode per connected
-  adapter every 11 seconds. Freed here in `be_query`/`be_enum`.
-- **Short-buffer check that does not match the read.** The original accepts
-  `dataSize >= 1` (`:80`, `:130`) and then dereferences a 4-byte `BOOL` through
-  it. We require `sizeof(BOOL)`.
-- **Raw `BOOL` comparison.** The readback compares `*(BOOL*)dataPtr !=
-  targetValue` (`:132`). The API documents *any* nonzero value as TRUE, so a
-  driver answering `0xFFFFFFFF` reads as a failure and provokes a rewrite
-  forever. We normalise both sides.
-- **One error kills the optimizer permanently.** The poll loop `break`s out on
-  any unexpected failure (`:340`) and nothing restarts it — silently, with no
-  UI. We count consecutive failures per adapter, show them, and keep going.
-- **Errors collapse into one global result.** `OptimizeWLAN` overwrites
-  `result` per adapter (`:207`, `:218`), so with two adapters you cannot tell
-  which one failed. State is tracked per adapter here.
-- **11-second polling.** After a reconnect the original leaves up to 11 seconds
-  of scanning, and its own README notes the poll itself may cause spikes. We
-  register for ACM notifications and re-apply within ~250 ms of a connection
-  change, with a 60-second watchdog as a backstop and a re-apply on resume from
-  sleep.
-- **A one-second blocking call with no thread to run on.** `WlanSetInterface`
-  takes about a second and the original holds a global mutex across it. Here it
-  runs on a worker thread that owns the WLAN handle; the UI thread never blocks.
-- **`ERROR_ACCESS_DENIED` is invisible.** The original returns a code nobody
-  sees. This app requests administrator up front so the common case never
-  arises, and still probes `WlanGetSecuritySettings` at startup — so if a write
-  is refused *even elevated*, it says so and names the likely cause (a group
-  policy or a changed Native Wifi DACL) instead of failing silently.
+### Interface
+- **Dark by default**; untick **Dark theme** in the tray menu for light
+- **Lives in the tray**; closing the window hides it, because the settings only last while the app is running.
+  The tray menu toggles **No background scans**, **Streaming mode** and **Performance**
 
-## Stopping all scanning
+# Getting started
 
-The **Stop scanning** switch disables Wi-Fi auto configuration
-(`wlan_intf_opcode_autoconf_enabled`). Background scan only asks the driver to
-stop hunting while associated; this stops the WLAN service scanning at all.
+## Installation
+Download `wificontrol.exe` from the **[latest release](https://github.com/sentinelb51/wificontrol/releases/latest)** and put it wherever you like.
+Every push to `main` replaces it, so that link always has the newest build.
 
-It is off by default, asks before arming, and is the one setting here with real
-consequences: **no roaming to a better access point, and no automatic
-reconnect if the link drops.**
+## Usage
+Run it and accept the UAC prompt. Windows refuses these settings to standard users, so it needs administrator;
+that's one prompt per start, and no permission problems after that.
 
-It also behaves differently from the other two opcodes in a way that dictates
-the entire design. Background scan and media streaming mode are reference
-counted per client handle and are reset by Windows when the adapter
-disconnects, so they cannot get stuck. Auto config has none of that. Nothing
-refcounts it, nothing resets it, and it outlives the process — the docs call it
-equivalent to `netsh wlan setautoconfig`. Disabled by a program that then dies,
-it stays disabled, across reboots, until something puts it back.
+Each adapter gets a card with its connection and what the driver reported for each setting.
+Switch **Manage** off on a card to leave that adapter alone. Turning a switch off hands its setting back without quitting,
+and every switch except **Block all scans** is remembered. **Exit** in the tray menu actually quits, and puts everything back.
 
-So it is put back:
+### Starting with Windows
+Apps that need administrator **can't** start from the Startup folder or a `Run` key; Windows silently skips them at logon.
+Use a scheduled task instead, which starts it elevated without a prompt:
 
-| When | What happens |
-| --- | --- |
-| The link drops | Re-enabled immediately, so Windows can reconnect |
-| You switch it off | Re-enabled |
-| The timer expires | Re-enabled, with a notification |
-| The master switch goes off | Re-enabled |
-| The app exits | Re-enabled before the WLAN handle closes |
-| Logging off or shutting down | Re-enabled from `WM_ENDSESSION`, before the reboot |
-| The app starts | Re-enabled if anything left it off |
-
-There is no journal and no record of what it used to be. The rule is a single
-positive condition — keep it off *only* while armed, enabled, managed and
-connected — evaluated against the live value on every pass. Whatever the reason
-it is off, including a previous run of this program that was killed, the next
-pass turns it back on. That is also why the armed state is deliberately **never
-saved to the config file**: the app always starts disarmed, so startup recovery
-is unconditional and there is no stored flag that could be wrong.
-
-The arm is time limited by default (15 minutes, or pick another span, or
-"until I turn it off"), because the realistic failure is not a crash — it is
-arming it and walking away.
-
-The residual risk, stated plainly: if the process is killed outright —
-`TerminateProcess`, a power cut — none of the exit paths run, and auto config
-stays disabled until you next start the app. Starting it fixes the machine.
-Nothing else will.
-
-## Metered
-
-The **Metered** switch, off by default, gives every saved Wi-Fi network on the
-managed adapters a *Variable* cost: pay per byte, the most restrictive cost
-Windows has. Windows Update holds back most downloads, Delivery Optimization
-stops sharing with other PCs, and OneDrive and the Store pause background sync
-and updates. Apps that read the connection cost cut back as well. Nothing about
-the radio changes; the link just carries less that you did not ask for.
-
-It is written with `netsh wlan set profileparameter cost=Variable`, which
-records the same per-network user cost as Settings. `WcmSetProperty` looks like
-the API for this and returns success, but on a Wi-Fi profile it only records an
-operator cost, which Windows ignores.
-
-Like auto config, the cost outlives the process, and it is put back the same
-way, with no journal. Settings only ever writes *Fixed*, so a network whose cost
-is exactly *Variable, set by the user* belongs to this app. It is reset to the
-Windows default whenever the switch is not in force: switched off, **Optimize**
-off, the adapter not managed, or the app exited. A run that was killed is
-repaired by the next start.
-
-Two differences from auto config. The switch is saved, so it survives a
-restart. And the cost is left in place through logoff and shutdown, so Windows
-Update gets no unmetered window before the app starts again.
-
-Turning it on overrides any network you had marked metered yourself, and
-turning it off leaves that network unmetered.
-
-## Tuning
-
-The **Tuning...** button opens the settings that actually move Wi-Fi latency,
-which the two wlanapi opcodes do not touch: the adapter's own advanced
-properties and the active power scheme.
-
-Every one of them is a dropdown containing exactly the choices the system
-declares, and the rules are the same throughout:
-
-- **Nothing is automatic.** The app never picks a value, never recommends one,
-  and never applies anything on its own. You choose, you press Apply.
-- **Adapter properties come from the driver.** They are read from its own
-  `Ndi\Params` metadata, so whatever your card exposes -- roaming
-  aggressiveness, power save mode, scan-when-associated, throughput booster --
-  appears under the name the driver gives it. Properties that are a numeric
-  range rather than a list of choices are left out; they are not dropdowns.
-- **A line on what a well-known setting does.** Microsoft's standardized
-  keywords (packet coalescing, ARP/NS offload, wake on pattern, selective
-  suspend...), Intel's own properties and both power settings carry a
-  one-line technical note: what changing the value does to the radio or the
-  link, never which value to pick. Notes are matched on the registry keyword,
-  not the display name, so a translated driver still gets them. A property the
-  app does not know is shown without one.
-- **Only the power settings on the Wi-Fi path.** Wireless Adapter Settings \
-  Power Saving Mode, and PCI Express \ Link State Power Management, which is
-  what lets an internal Wi-Fi card's link doze between packets. Display,
-  processor, GPU and battery policy is not shown. Windows marks ASPM hidden;
-  it is listed anyway. A setting this machine does not have is simply absent.
-- **Wi-Fi Direct as one dropdown.** The virtual adapters Windows puts on the
-  card for Miracast, Mobile Hotspot and Wi-Fi Direct get a single Enabled or
-  Disabled choice, matched to this card by parent device. Disabled turns those
-  features off. It applies at once and persists across restarts, like
-  disabling them in Device Manager.
-- **No before/after tracking, no undo journal.** The registry and the power
-  scheme are the state. Nothing is recorded anywhere about what a value used to
-  be. To undo a change, pick the other entry in the same dropdown.
-- **Only what you changed is written.** Untouched dropdowns are not rewritten.
-
-Each power setting has two dropdowns, **plugged in** and **on battery**,
-because Windows stores them separately and writing one would say nothing about
-the other. They take effect immediately. A row you have changed is marked, and
-Apply stays disabled until something has been.
-
-Adapter properties do not: the miniport reads them when it starts, so a change
-sits in the registry until the device restarts. **Restart adapter** does that
-explicitly -- it disables and re-enables the device the way Device Manager does
-when you press OK on the Advanced tab, and it drops the link for a few seconds.
-It asks first, and it never happens on its own.
-
-## Design notes
-
-- **ACM notifications only.** `WLAN_NOTIFICATION_SOURCE_MSM` additionally
-  requires the `wiFiControl` device capability, which since the 2024
-  [Wi-Fi/location changes][loc] is gated behind precise-location consent and
-  returns `ERROR_ACCESS_DENIED` for an ordinary desktop app. ACM alone reports
-  every transition that matters here.
-- **No location prompt, ever.** The app deliberately never calls
-  `WlanQueryInterface(wlan_intf_opcode_current_connection)`, `WlanScan`,
-  `WlanGetAvailableNetworkList` or `WlanGetNetworkBssList` — all of which now
-  require precise-location consent, raise a system prompt, and light up the
-  location-in-use icon in the tray. Everything shown here comes from
-  `WlanEnumInterfaces`, the BOOL opcodes, `WlanGetProfileList` and
-  `WcmQueryProperty`, none of which are affected.
-- **No per-notification-code filtering.** The ACM enumeration is based at
-  `L2_NOTIFICATION_CODE_V2_BEGIN`, which the mingw-w64 headers do not define —
-  they number it from 0 instead. Comparing against those constants would
-  silently match nothing if the real base is nonzero, so every ACM notification
-  triggers one debounced, rate-limited poll instead. A poll that finds nothing
-  to change costs two `WlanQueryInterface` calls per adapter.
-- **The policy layer knows nothing about Windows.** `src/wlan_core.c` talks to
-  a four-function backend, so all the decision-making is unit-tested on the
-  build host under ASan/UBSan. Each test in `tests/test_core.c` pins one of the
-  defects listed above.
-
-[loc]: https://learn.microsoft.com/en-us/windows/win32/nativewifi/wi-fi-access-location-changes
-
-## Using it
-
-The app manifest requests administrator, because `WlanSetInterface` on these
-two opcodes is gated by the Native Wifi securable objects and a standard user
-is normally refused. So there is **one UAC prompt each time it starts**, and no
-permission problems after that.
-
-Run it. Each adapter gets a card showing its connection and what the driver
-reported back for each setting, ticked where it matches what was asked for;
-switch **Manage** off on a card to leave that adapter alone. **Optimize** turns
-everything off and hands the settings back without quitting. Closing the window
-hides it to the tray — the settings only last while the process is alive — and
-Exit in the tray menu really quits.
-
-The window is dark by default. **Dark theme** in the tray menu switches it to
-light and back, and the choice is saved. Popup menus follow along on Windows 10
-1903 and later through an undocumented uxtheme export, guarded by build number;
-the two confirmation prompts are standard message boxes and stay light.
-
-### Starting it automatically
-
-An app that requires administrator **cannot** be launched from the Startup
-folder or a `Run` key: Windows will not raise a UAC prompt at logon, so the
-entry is silently skipped. Use a scheduled task with highest privileges
-instead, which starts it elevated with no prompt at all:
-
-```
-schtasks /create /tn WifiControl /sc onlogon /rl highest /f ^
-         /tr "\"C:\path\to\wificontrol.exe\" /tray"
+```cmd
+schtasks /create /tn WifiControl /sc onlogon /rl highest /f /tr "\"C:\path\to\wificontrol.exe\" /tray"
 ```
 
-`/tray` starts it hidden in the notification area. Remove it again with
-`schtasks /delete /tn WifiControl /f`.
+`/tray` starts it hidden. To remove it, run `schtasks /delete /tn WifiControl /f`
 
-### Where settings live
+### Settings
+Stored in `%LOCALAPPDATA%\WifiControl\wificontrol.ini`. For portable mode, create an empty `wificontrol.ini` next to the executable.
 
-`%LOCALAPPDATA%\WifiControl\wificontrol.ini`, or a `wificontrol.ini` next to
-the executable if you create one there first (portable mode). Nothing else is
-written. Note that if you elevate using a *different* administrator account,
-`%LOCALAPPDATA%` resolves to that account's profile.
+Don't delete `wificontrol-restore.ini` while **Performance** is on; it holds the values that switch puts back.
 
 ## Building
+Needs mingw-w64, nothing else. Builds on Windows, Linux or macOS.
 
-Needs mingw-w64; nothing else. Builds from Linux, macOS or MSYS2.
-
+```bash
+make        # build/wificontrol.exe
+make test   # unit tests under ASan/UBSan
 ```
-make          # build/wificontrol.exe
-make test     # run the core tests natively under ASan/UBSan
-```
 
-The Makefile probes for the newest C standard each compiler accepts —
-`-std=c23` on GCC 14+, `-std=c2x` on GCC 13 and earlier, which is the same
-language under the older spelling. Override with `make STD=c17` if you need to.
+The decision-making (`src/wlan_core.c`, `src/perf.c`) never sees Windows, so it's unit-tested on any host.
 
-Built `-O3 -flto` with `-ffunction-sections`/`--gc-sections`. Nothing is
-allowed to add instructions to the hot path: `-fno-stack-protector` (no canary
-load and compare per frame) and `-fcf-protection=none` (no `endbr64` at every
-indirect branch target). The resulting binary contains zero of either.
+## Resource usage
+Sitting in the tray, it uses:
 
-`--dynamicbase --nxcompat --high-entropy-va` stay on. Those are PE header bits
-and load-time relocations — they execute nothing and cost no CPU, and without
-them the binary is the kind of thing SmartScreen and AV heuristics flag.
-
-`make OPT=-Os` for the smallest build. `make ARCH=x86-64-v2` (SSE4.2, ~2009+)
-or `ARCH=x86-64-v3` (AVX2, ~2013+) if you only ever run it on your own
-machines; the default baseline runs anywhere, and an older CPU will fault on an
-instruction it does not have.
-
-## Layout
-
-| File | |
-| --- | --- |
-| `src/wlan.h`, `src/wlan_core.c` | policy: what to apply, when to retry, how to read an error |
-| `src/wlan_win32.c` | the only file that touches wlanapi, and the profile cost through WCM and netsh |
-| `src/app.c` | config, icon, worker thread, startup |
-| `src/app_ui.c` | the main window: switches, adapter cards, tray |
-| `src/ui.h`, `src/ui_draw.c`, `src/ui_ctl.c` | theme, anti-aliased drawing, owner-drawn switches and buttons, scrolling panel |
-| `src/tune.h`, `src/tune.c` | the settings model, and writing only what changed |
-| `src/tune_driver.c` | adapter advanced properties, from the driver's `Ndi\Params`, notes on well-known ones, and the card's Wi-Fi Direct adapters |
-| `src/tune_power.c` | the two Wi-Fi-path power settings in the active scheme |
-| `src/tune_ui.c` | the tuning window |
-| `tests/test_core.c` | regression test per fixed defect and per recovery path |
-| `planned/monitoring.md` | design for the latency/signal monitor; not implemented |
+- ~0.00% CPU
+- ~3 MB of RAM

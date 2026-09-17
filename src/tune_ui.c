@@ -1,7 +1,7 @@
 /* tune_ui.c -- the tuning window.
  *
  * One row per setting the system says has a fixed set of choices, each with
- * its own dropdown of exactly those choices, and an Apply button.  The app
+ * its own dropdown of exactly those choices, and an Apply button.  The window
  * never proposes a value and never remembers a previous one; to undo something
  * you pick the other entry in the same dropdown.
  */
@@ -30,9 +30,16 @@ enum {
 };
 #define P(v) ui_px((v), t->f.dpi)
 
-/* A row is one setting; a power row pairs its plugged-in and on-battery
- * entries.  Either index is -1 when that half is absent. */
+/* A power row pairs its plugged-in and on-battery entries.  Either index is -1
+ * when that half is absent. */
 typedef struct { int ac, dc; } trow;
+
+/* A card of rows with one dropdown each, stacked from top. */
+typedef struct {
+    int idx[TUNE_MAX_SETTINGS];     /* each row's setting */
+    int y  [TUNE_MAX_SETTINGS + 1]; /* each row's offset below top */
+    int n, top, hint;
+} tcard;
 
 typedef struct {
     wc_guid    adapter;
@@ -40,13 +47,12 @@ typedef struct {
     tune_list *list;
     ui_fonts   f;
     HWND       dlg, panel;
-    trow       driver[TUNE_MAX_SETTINGS], power[TUNE_MAX_SETTINGS];
-    int        n_driver, n_power;
-    int        wfd;                             /* the Wi-Fi Direct setting, or -1 */
-    int        driver_y[TUNE_MAX_SETTINGS + 1]; /* each adapter row's offset below driver_top */
-    int        driver_top, driver_hint, wfd_top, wfd_hint, power_top, power_hint, content;
+    tcard      driver, wfd, asleep; /* adapter properties, Wi-Fi Direct, sleep-only properties */
+    trow       power[TUNE_MAX_SETTINGS];
+    int        n_power, power_top, power_hint, content;
     wchar_t    status[256];
     bool       status_err;
+    bool       perf;                        /* the Performance switch is holding values */
 } tune_ctx;
 
 static void collect(tune_ctx *t)
@@ -98,6 +104,34 @@ static void paint_marker(tune_ctx *t, ui_canvas *cv, int y0, int y1)
     ui_rrect(cv, P(PAD) + 4 * s, y0 + P(12), P(PAD) + 7 * s, y1 - P(12), 1.5 * s, ui_pal.accent);
 }
 
+static void paint_heading(tune_ctx *t, ui_canvas *cv, const wchar_t *title, int y)
+{
+    ui_text(cv, t->f.bold, ui_pal.text, title, P(PAD) + P(2), y - P(SECTION_H),
+            cv->w - P(PAD) - P(14), y - P(8), DT_SINGLELINE | DT_BOTTOM);
+}
+
+/* A card's frame and rows; its hint line is the caller's. */
+static void paint_card(tune_ctx *t, ui_canvas *cv, const tcard *c, int scroll)
+{
+    const tune_list *l = t->list;
+    const int in = P(PAD) + P(14), right = cv->w - P(PAD) - P(14);
+    const UINT one = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+    const int y = c->top - scroll;
+
+    paint_card_frame(t, cv, y, c->hint - scroll);
+    for (int k = 0; k < c->n; ++k) {
+        const int ry = y + c->y[k];
+        const tune_setting *s = &l->s[c->idx[k]];
+        if (k) paint_rule(t, cv, ry);
+        if (row_pending(l, (trow){ c->idx[k], -1 })) paint_marker(t, cv, ry, y + c->y[k + 1]);
+        ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry, right - P(COMBO_W) - P(12),
+                ry + head_h(t, s), one);
+        if (s->help)
+            ui_text(cv, t->f.small, ui_pal.text2, s->help, in, ry + P(HELP_Y), right,
+                    ry + P(HELP_Y + HELP_H), one);
+    }
+}
+
 static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll, void *ctx)
 {
     tune_ctx *t = ctx;
@@ -106,45 +140,27 @@ static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll
     const UINT one = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
 
     /* Adapter properties */
-    int y = t->driver_top - scroll;
-    ui_text(cv, t->f.bold, ui_pal.text, L"Adapter properties",
-            P(PAD) + P(2), y - P(SECTION_H), right, y - P(8), DT_SINGLELINE | DT_BOTTOM);
-    paint_card_frame(t, cv, y, t->driver_hint - scroll);
-    if (t->n_driver == 0) {
+    int y = t->driver.top - scroll;
+    paint_heading(t, cv, L"Adapter properties", y);
+    paint_card(t, cv, &t->driver, scroll);
+    if (t->driver.n == 0) {
         ui_text(cv, t->f.body, ui_pal.text2,
-                l->have_instance ? L"The driver declares no settings with a fixed list of choices."
-                                 : L"Could not locate this adapter's driver key.",
+                !l->have_instance ? L"Could not locate this adapter's driver key."
+                : t->asleep.n     ? L"The driver's only settings act while the PC sleeps."
+                                  : L"The driver declares no settings with a fixed list of choices.",
                 in, y, right, y + P(ROW_H), one);
     }
-    for (int k = 0; k < t->n_driver; ++k) {
-        const int ry = y + t->driver_y[k];
-        const tune_setting *s = &l->s[t->driver[k].ac];
-        if (k) paint_rule(t, cv, ry);
-        if (row_pending(l, t->driver[k])) paint_marker(t, cv, ry, y + t->driver_y[k + 1]);
-        ui_text(cv, t->f.body, ui_pal.text, s->name, in, ry, right - P(COMBO_W) - P(12),
-                ry + head_h(t, s), one);
-        if (s->help)
-            ui_text(cv, t->f.small, ui_pal.text2, s->help, in, ry + P(HELP_Y), right,
-                    ry + P(HELP_Y + HELP_H), one);
-    }
-    y = t->driver_hint - scroll;
+    y = t->driver.hint - scroll;
     ui_text(cv, t->f.small, ui_pal.text2,
             L"Read by the driver when it starts: restart the adapter to use a change.",
             P(PAD) + P(2), y, cv->w - P(PAD) - P(RESTART_W) - P(12), y + P(HINT_H), one);
 
     /* Wi-Fi Direct, only when the card has the virtual adapters at all */
-    if (t->wfd >= 0) {
-        const tune_setting *s = &l->s[t->wfd];
-        y = t->wfd_top - scroll;
-        ui_text(cv, t->f.bold, ui_pal.text, L"Wi-Fi Direct",
-                P(PAD) + P(2), y - P(SECTION_H), right, y - P(8), DT_SINGLELINE | DT_BOTTOM);
-        paint_card_frame(t, cv, y, t->wfd_hint - scroll);
-        if (row_pending(l, (trow){ t->wfd, -1 })) paint_marker(t, cv, y, t->wfd_hint - scroll);
-        ui_text(cv, t->f.body, ui_pal.text, s->name, in, y, right - P(COMBO_W) - P(12),
-                y + head_h(t, s), one);
-        ui_text(cv, t->f.small, ui_pal.text2, s->help, in, y + P(HELP_Y), right,
-                y + P(HELP_Y + HELP_H), one);
-        y = t->wfd_hint - scroll;
+    if (t->wfd.n) {
+        y = t->wfd.top - scroll;
+        paint_heading(t, cv, L"Wi-Fi Direct", y);
+        paint_card(t, cv, &t->wfd, scroll);
+        y = t->wfd.hint - scroll;
         ui_text(cv, t->f.small, ui_pal.text2,
                 L"Applied to the devices when you press Apply, and kept across restarts.",
                 P(PAD) + P(2), y, cv->w - P(PAD), y + P(HINT_H), one);
@@ -152,8 +168,7 @@ static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll
 
     /* Power */
     y = t->power_top - scroll;
-    ui_text(cv, t->f.bold, ui_pal.text, L"Power",
-            P(PAD) + P(2), y - P(SECTION_H), right, y - P(8), DT_SINGLELINE | DT_BOTTOM);
+    paint_heading(t, cv, L"Power", y);
     paint_card_frame(t, cv, y, t->power_hint - scroll);
 
     if (t->n_power == 0)
@@ -187,6 +202,17 @@ static void paint_content([[maybe_unused]] HWND panel, ui_canvas *cv, int scroll
     ui_text(cv, t->f.small, ui_pal.text2,
             L"Written to the active power plan, and in effect as soon as you press Apply.",
             P(PAD) + P(2), y, cv->w - P(PAD), y + P(HINT_H), one);
+
+    /* Last, since none of these changes anything while the PC is in use. */
+    if (t->asleep.n) {
+        y = t->asleep.top - scroll;
+        paint_heading(t, cv, L"While the PC sleeps", y);
+        paint_card(t, cv, &t->asleep, scroll);
+        y = t->asleep.hint - scroll;
+        ui_text(cv, t->f.small, ui_pal.text2,
+                L"Adapter properties too: restart the adapter above to use a change.",
+                P(PAD) + P(2), y, cv->w - P(PAD), y + P(HINT_H), one);
+    }
 }
 
 static void paint_frame(tune_ctx *t)
@@ -215,6 +241,18 @@ static void paint_frame(tune_ctx *t)
 
 /* ----------------------------------------------------------------- layout */
 
+static void add_combo(tune_ctx *t, int i)
+{
+    const tune_setting *s = &t->list->s[i];
+    HWND cb = ui_combo(t->panel, IDC_TUNE_VALUE + i, t->f.body, P(22));
+    if (!cb) return;
+    for (int k = 0; k < s->n_opt; ++k)
+        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)s->opt[k].label);
+    SendMessageW(cb, CB_SETCURSEL, (WPARAM)s->sel, 0);
+    if (s->sel < 0) SendMessageW(cb, CB_SETCUEBANNER, 0, (LPARAM)L"Not one of the choices");
+    SetWindowTextW(cb, s->name); /* the name a screen reader reads */
+}
+
 static void build(tune_ctx *t)
 {
     for (int i = 0; i < TUNE_MAX_SETTINGS; ++i) {
@@ -223,16 +261,12 @@ static void build(tune_ctx *t)
     }
 
     const tune_list *l = t->list;
-    t->n_driver = t->n_power = 0;
-    t->wfd = -1;
+    t->driver.n = t->wfd.n = t->asleep.n = t->n_power = 0;
     for (int i = 0; i < l->n; ++i) {
         const tune_setting *s = &l->s[i];
-        if (s->src == TUNE_DRIVER) {
-            t->driver[t->n_driver++] = (trow){ i, -1 };
-            continue;
-        }
-        if (s->src == TUNE_DEVICE) {
-            t->wfd = i;
+        if (s->src != TUNE_POWER) {
+            tcard *c = s->src == TUNE_DEVICE ? &t->wfd : s->asleep ? &t->asleep : &t->driver;
+            c->idx[c->n++] = i;
             continue;
         }
         /* tune_collect_power adds plugged in, then on battery. */
@@ -244,21 +278,20 @@ static void build(tune_ctx *t)
             t->power[t->n_power++] = s->on_battery ? (trow){ -1, i } : (trow){ i, -1 };
     }
 
-    for (int i = 0; i < l->n; ++i) {
-        const tune_setting *s = &l->s[i];
-        HWND cb = ui_combo(t->panel, IDC_TUNE_VALUE + i, t->f.body, P(22));
-        if (!cb) continue;
-        for (int k = 0; k < s->n_opt; ++k)
-            SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)s->opt[k].label);
-        SendMessageW(cb, CB_SETCURSEL, (WPARAM)s->sel, 0);
-        if (s->sel < 0) SendMessageW(cb, CB_SETCUEBANNER, 0, (LPARAM)L"Not one of the choices");
-        SetWindowTextW(cb, s->name); /* the name a screen reader reads */
+    /* Created in the order they sit on screen, which makes it the tab order.
+     * The sleep-only rows are listed among the others, but shown last. */
+    for (int k = 0; k < t->driver.n; ++k) add_combo(t, t->driver.idx[k]);
+    for (int k = 0; k < t->wfd.n; ++k)    add_combo(t, t->wfd.idx[k]);
+    for (int k = 0; k < t->n_power; ++k) {
+        if (t->power[k].ac >= 0) add_combo(t, t->power[k].ac);
+        if (t->power[k].dc >= 0) add_combo(t, t->power[k].dc);
     }
+    for (int k = 0; k < t->asleep.n; ++k) add_combo(t, t->asleep.idx[k]);
 
     /* Recreated dropdowns land after Restart in the tab order; put it back
      * straight after the adapter's own dropdowns, where it sits on screen. */
     HWND restart = GetDlgItem(t->panel, IDC_TUNE_RESTART);
-    HWND after = t->n_driver ? GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver[t->n_driver - 1].ac)
+    HWND after = t->driver.n ? GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver.idx[t->driver.n - 1])
                              : nullptr;
     if (restart)
         SetWindowPos(restart, after ? after : HWND_TOP, 0, 0, 0, 0,
@@ -270,22 +303,35 @@ static void place(HWND w, int x, int y, int cw, int ch)
     if (w) SetWindowPos(w, nullptr, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+/* Stacks a card's rows from top, an empty card keeping one row for its
+ * message.  Returns the bottom of its hint line. */
+static int stack(tune_ctx *t, tcard *c, int top)
+{
+    c->top  = top;
+    c->y[0] = 0;
+    for (int k = 0; k < c->n; ++k)
+        c->y[k + 1] = c->y[k] + row_h(t, &t->list->s[c->idx[k]]);
+    c->hint = top + (c->n ? c->y[c->n] : P(ROW_H));
+    return c->hint + P(HINT_H);
+}
+
+static void place_card(tune_ctx *t, const tcard *c, int x, int scroll, int combo_h)
+{
+    for (int k = 0; k < c->n; ++k)
+        place(GetDlgItem(t->panel, IDC_TUNE_VALUE + c->idx[k]), x,
+              c->top + c->y[k] - scroll + (head_h(t, &t->list->s[c->idx[k]]) - combo_h) / 2,
+              P(COMBO_W), P(300));
+}
+
 static void layout(tune_ctx *t, const RECT *at)
 {
-    t->driver_y[0] = 0;
-    for (int k = 0; k < t->n_driver; ++k)
-        t->driver_y[k + 1] = t->driver_y[k] + row_h(t, &t->list->s[t->driver[k].ac]);
-    t->driver_top  = P(SECTION_H);
-    t->driver_hint = t->driver_top + (t->n_driver ? t->driver_y[t->n_driver] : P(ROW_H));
-    int next       = t->driver_hint + P(HINT_H) + P(SECTION_H);
-    if (t->wfd >= 0) {
-        t->wfd_top  = next;
-        t->wfd_hint = t->wfd_top + row_h(t, &t->list->s[t->wfd]);
-        next        = t->wfd_hint + P(HINT_H) + P(SECTION_H);
-    }
-    t->power_top   = next;
-    t->power_hint  = t->power_top + (t->n_power ? t->n_power * P(POWER_ROW_H) : P(ROW_H));
-    t->content     = t->power_hint + P(HINT_H);
+    int end = stack(t, &t->driver, P(SECTION_H));
+    if (t->wfd.n) end = stack(t, &t->wfd, end + P(SECTION_H));
+    t->power_top  = end + P(SECTION_H);
+    t->power_hint = t->power_top + (t->n_power ? t->n_power * P(POWER_ROW_H) : P(ROW_H));
+    end = t->power_hint + P(HINT_H);
+    if (t->asleep.n) end = stack(t, &t->asleep, end + P(SECTION_H));
+    t->content = end;
 
     const int view = t->content < P(VIEW_MAX) ? t->content : P(VIEW_MAX);
     const int cw = P(CLIENT_W), ch = P(TITLE_H) + view + P(FOOT_H);
@@ -310,15 +356,9 @@ static void layout(tune_ctx *t, const RECT *at)
         combo_h = r.bottom - r.top;
     }
 
-    for (int k = 0; k < t->n_driver; ++k) {
-        const int ry = t->driver_top + t->driver_y[k] - scroll;
-        place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->driver[k].ac), right - P(COMBO_W),
-              ry + (head_h(t, &l->s[t->driver[k].ac]) - combo_h) / 2, P(COMBO_W), P(300));
-    }
-    if (t->wfd >= 0)
-        place(GetDlgItem(t->panel, IDC_TUNE_VALUE + t->wfd), right - P(COMBO_W),
-              t->wfd_top - scroll + (head_h(t, &l->s[t->wfd]) - combo_h) / 2,
-              P(COMBO_W), P(300));
+    place_card(t, &t->driver, right - P(COMBO_W), scroll, combo_h);
+    place_card(t, &t->wfd,    right - P(COMBO_W), scroll, combo_h);
+    place_card(t, &t->asleep, right - P(COMBO_W), scroll, combo_h);
     const int in   = P(PAD) + P(14);
     const int ac_x = in + P(POWER_LABEL_W);
     const int dc_x = in + P(POWER_LABEL_W + POWER_COMBO_W + 20 + POWER_LABEL_W);
@@ -334,7 +374,7 @@ static void layout(tune_ctx *t, const RECT *at)
     }
 
     place(GetDlgItem(t->panel, IDC_TUNE_RESTART), pr.right - P(PAD) - P(RESTART_W),
-          t->driver_hint + (P(HINT_H) - P(BUTTON_H - 2)) / 2 - scroll,
+          t->driver.hint + (P(HINT_H) - P(BUTTON_H - 2)) / 2 - scroll,
           P(RESTART_W), P(BUTTON_H - 2));
 
     const int by = ch - P(PAD) - P(BUTTON_H);
@@ -454,7 +494,9 @@ static INT_PTR CALLBACK tune_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
         ui_control(dlg, IDC_TUNE_APPLY, UI_PRIMARY, L"Apply", false);
         ui_control(dlg, IDOK, UI_BUTTON, L"Close", false);
 
-        wcscpy(t->status, L"Nothing is written until you press Apply.");
+        wcscpy(t->status, t->perf
+               ? L"Performance is on and holds some of these values until it is switched off."
+               : L"Nothing is written until you press Apply.");
         collect(t);
         build(t);
         apply_fonts(t);
@@ -480,6 +522,13 @@ static INT_PTR CALLBACK tune_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CTLCOLORLISTBOX:
         return (INT_PTR)ui_ctlcolor((HDC)wp);
+
+    case WM_MOUSEWHEEL:
+        /* The wheel goes to the focus, which starts on Close, outside the
+         * list.  The button passes it up to here. */
+        if (!t) return FALSE;
+        SendMessageW(t->panel, msg, wp, lp);
+        return TRUE;
 
     case WM_COMMAND: {
         if (!t) return FALSE;
@@ -520,12 +569,13 @@ static INT_PTR CALLBACK tune_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
     return FALSE;
 }
 
-void tune_dialog(HWND parent, const wc_guid *adapter, const wchar_t *adapter_name)
+void tune_dialog(HWND parent, const wc_guid *adapter, const wchar_t *adapter_name, bool perf_on)
 {
     /* Big enough (two row tables) that it is not a stack object either. */
     tune_ctx *t = calloc(1, sizeof *t);
     if (!t) return;
     t->adapter = *adapter;
+    t->perf    = perf_on;
     wcsncpy(t->adapter_name, adapter_name ? adapter_name : L"", WC_NAME_MAX - 1);
 
     /* Well over a megabyte with the option tables: not a stack object. */
